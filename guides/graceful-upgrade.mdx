@@ -1,7 +1,7 @@
 ---
-title: "Graceful Zero-Downtime Binary Upgrade"
+title: "Pingora Graceful Zero-Downtime Binary Upgrade Guide"
 sidebarTitle: "Graceful Upgrade"
-description: "Upgrade a running Pingora server binary with zero dropped connections using the SIGQUIT signal and --upgrade flag."
+description: "Replace a running Pingora server binary with zero dropped connections: start the new instance with --upgrade, then send SIGQUIT to the old."
 ---
 
 Pingora's graceful upgrade mechanism lets you replace a running server binary without interrupting any in-flight HTTP connections. From the client's perspective the listening socket never closes — there is no window during which a connection attempt would be refused.
@@ -71,13 +71,14 @@ The old instance transfers its listening socket file descriptors to the new inst
 
 ## Combined Command
 
-For a quick local upgrade (e.g., during development), you can run both steps together:
+For a quick local upgrade (e.g., during development), you can run both steps in sequence. Start the new binary with `--upgrade` first (it will block waiting on the upgrade socket), then signal the old instance:
 
 ```bash
-pkill -SIGQUIT load_balancer && RUST_LOG=INFO cargo run -- -c conf.yaml -d -u
+RUST_LOG=INFO cargo run -- -c conf.yaml -d -u &
+pkill -SIGQUIT load_balancer
 ```
 
-This sends SIGQUIT to the old process and immediately launches the new one with `--upgrade`, relying on the upgrade socket to synchronize the handover.
+The new process blocks waiting to receive the listening socket file descriptors. Once SIGQUIT is delivered, the old instance transfers the sockets and the new instance begins serving traffic immediately.
 
 ## What the Client Sees
 

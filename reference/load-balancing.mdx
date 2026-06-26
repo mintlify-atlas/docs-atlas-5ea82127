@@ -281,7 +281,7 @@ use pingora::lb::discovery::Static;
 let discovery = Static::try_from_iter(["10.0.0.1:80", "10.0.0.2:80"])?;
 ```
 
-You can also mutate a `Static` discovery at runtime by calling its `add` / `remove` methods, though concurrent modifications may race — for production dynamic discovery implement the `ServiceDiscovery` trait instead.
+For production dynamic discovery, implement the `ServiceDiscovery` trait directly rather than using `Static`.
 
 ---
 

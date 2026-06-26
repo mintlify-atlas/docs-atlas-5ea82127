@@ -19,7 +19,7 @@ pid_file: /run/my-proxy.pid
 upgrade_sock: /tmp/my-proxy-upgrade.sock
 ```
 
-The `error_log` path must be writable by the process. Pingora opens it with `O_APPEND | O_CREAT`, so existing log content is preserved across restarts.
+The `error_log` path must be writable by the process.
 
 <Note>
 When `error_log` is not set in the configuration — or when running in the foreground (non-daemon mode) — all log output goes to STDERR. This is the expected behaviour in containerised environments where the container runtime collects STDERR automatically.
@@ -124,7 +124,7 @@ fn suppress_error_log(
 }
 ```
 
-A companion hook, `suppress_proxy_warn_log`, applies to retryable upstream failures and downstream errors that occur while a cache fill is in progress. Its signature is similar and it receives an additional `ProxyWarnLogContext` argument that identifies the specific warning scenario.
+A companion hook, `suppress_proxy_warn_log`, applies to retryable upstream failures and downstream errors that occur while a cache fill is in progress. Its signature is similar and it receives an additional `ProxyWarnLogContext` argument that identifies the specific warning scenario. This hook is marked **experimental** in the source and its API may change in a future release.
 
 <Note>
 Suppressing errors removes the only per-request audit record for that failure path. If you suppress a class of errors, consider emitting a Prometheus counter or a structured log entry in the same override so that the failures remain observable in aggregate.

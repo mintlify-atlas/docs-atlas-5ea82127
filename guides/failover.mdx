@@ -136,10 +136,11 @@ fn error_while_proxy(
     &self,
     peer: &HttpPeer,
     session: &mut Session,
-    mut e: Box<Error>,
+    e: Box<Error>,
     ctx: &mut Self::CTX,
     client_reused: bool,
 ) -> Box<Error> {
+    let mut e = e;
     // Only retry on reused connections where nothing has been sent downstream
     e.retry.decide_reuse(client_reused && !session.as_ref().retry_buffer_truncated());
     e

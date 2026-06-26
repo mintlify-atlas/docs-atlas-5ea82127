@@ -1,7 +1,7 @@
 ---
-title: "Pingora Configuration File Reference"
+title: "Complete Pingora YAML Configuration File Reference"
 sidebarTitle: "Configuration"
-description: "All YAML configuration options for Pingora servers — threads, pid file, upgrade socket, TLS root CA, runtime tuning, and more."
+description: "All YAML configuration keys for Pingora servers — threads, pid file, upgrade socket, TLS root CA, runtime tuning, daemon settings, and more."
 ---
 
 Pingora reads its settings from a YAML file whose path is supplied via the `-c` / `--conf` CLI flag. The file is a flat key-value map; unknown keys are silently ignored, which lets you embed your own application settings in the same file. The only required field is `version`, which must be `1`.

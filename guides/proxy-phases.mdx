@@ -36,6 +36,7 @@ The diagram below shows how phases connect to one another, including retry and e
 new request
   → early_request_filter
   → request_filter ──────────────────────────────────────────► logging
+  → proxy_upstream_filter
   → upstream_peer
   → [IO: connect to upstream]
       ├─ success → connected_to_upstream
@@ -196,7 +197,8 @@ async fn connected_to_upstream(
     session: &mut Session,
     reused: bool,
     peer: &HttpPeer,
-    fd: RawFd,          // unix
+    #[cfg(unix)] fd: std::os::unix::io::RawFd,
+    #[cfg(windows)] sock: std::os::windows::io::RawSocket,
     digest: Option<&Digest>,
     ctx: &mut Self::CTX,
 ) -> Result<()>

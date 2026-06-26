@@ -1,7 +1,7 @@
 ---
-title: "Running Pingora Under systemd"
+title: "Integrate Pingora with systemd for Lifecycle Management"
 sidebarTitle: "systemd"
-description: "Configure systemd service units to manage Pingora server lifecycle, including socket activation and graceful restart on binary update."
+description: "How to configure a systemd service unit for Pingora, using Type=forking and ExecReload to trigger zero-downtime graceful upgrades with systemctl reload."
 ---
 
 Pingora does not depend on systemd, but it integrates naturally with it. Because Pingora handles its own daemonization, PID tracking, and graceful upgrade signalling, you only need a small service unit to wire everything together. The result is a fully managed service that supports `systemctl start`, `systemctl stop`, and — most usefully — `systemctl reload` for zero-downtime binary upgrades.

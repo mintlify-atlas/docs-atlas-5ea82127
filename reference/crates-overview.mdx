@@ -28,6 +28,7 @@ The workspace uses Cargo resolver v2 and keeps shared dependency versions in `[w
 | `pingora-timeout` | Efficient async timer system with shared time wheel | `time` | More efficient than `tokio::time::timeout` at scale |
 | `pingora-ketama` | Ketama consistent-hashing algorithm | — | Used by `selection::Consistent` in `pingora-load-balancing` |
 | `pingora-lru` | LRU cache data structure used by storage backends | — | Internal use; re-exported where needed |
+| `pingora-runtime` | Tokio runtime construction helpers and `RuntimeOpts` | — | Used internally; exposes `RuntimeOpts` for per-service tuning |
 | `pingora-openssl` | OpenSSL API compatibility layer (`ssl`, `x509`, `pkey`) | `openssl` | Requires native OpenSSL libs and Perl 5 at build time |
 | `pingora-boringssl` | BoringSSL API compatibility layer (identical API surface to `pingora-openssl`) | `boringssl` | Requires Clang; FIPS-compatible; used by Cloudflare internally |
 | `pingora-s2n` | AWS s2n-tls extensions: PSK, security policies, blinding delays | `s2n` | Requires native s2n-tls libraries |
@@ -94,6 +95,7 @@ Swap `openssl` for `boringssl` — the rest of the API is identical.
 | `sentry` | Enables Sentry error-reporting integration in `pingora-core`. |
 | `dial9` | Enables Tokio runtime telemetry (requires `--cfg tokio_unstable`). |
 | `dial9-worker-s3` | Adds S3-compatible trace-segment upload to `dial9`. Implies `dial9`. |
+| `dial9-cpu-profiling` | Enables CPU profiling support for `dial9`. Implies `dial9`. |
 | `connection_filter` | Enables pre-TLS TCP connection filtering via `ConnectionFilter` trait. |
 | `upstream_modules` | Enables the `adjust_upstream_modules` callback for custom upstream response processing. |
 

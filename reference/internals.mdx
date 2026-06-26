@@ -224,24 +224,16 @@ The `start_with_ready_notifier` variant is useful when downstream services must 
 
 ---
 
-## Per-Service Runtime Customisation
+## Per-Service Thread Count
 
-For advanced use cases, the Tokio runtime options for an individual service can be overridden without changing the global server configuration. Set a `RuntimeOptsOverride` callback on the service:
+Each listening service has a `threads` field that overrides the global default for that service alone:
 
 ```rust
-use std::sync::Arc;
-use pingora::services::listening::Service;
-
-let override_fn: RuntimeOptsOverride = Arc::new(|global_opts| {
-    let mut opts = global_opts.clone();
-    opts.worker_threads = Some(2); // this service gets only 2 threads
-    Some(opts)
-});
-
-my_service.set_runtime_opts_override(override_fn);
+// Override thread count for a specific service (global default is used when None)
+my_service.threads = Some(2);
 ```
 
-Returning `None` from the callback means "use the global settings unchanged." Returning `Some(opts)` replaces the runtime configuration for that service only.
+For advanced Tokio runtime options (alternative timer, dial9 telemetry), use the `set_runtime_opts_override` method, which accepts a `RuntimeOptsOverride` callback (`Arc<dyn Fn(&RuntimeOpts) -> Option<RuntimeOpts> + Send + Sync>`). Returning `None` from the callback applies the global settings unchanged.
 
 ---
 

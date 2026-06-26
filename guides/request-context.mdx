@@ -182,7 +182,8 @@ async fn connected_to_upstream(
     _session: &mut Session,
     reused: bool,
     _peer: &HttpPeer,
-    _fd: RawFd,
+    #[cfg(unix)] _fd: std::os::unix::io::RawFd,
+    #[cfg(windows)] _sock: std::os::windows::io::RawSocket,
     _digest: Option<&Digest>,
     ctx: &mut Self::CTX,
 ) -> Result<()> {

@@ -24,7 +24,7 @@ my_server.set_sentry_config(
             .into_dsn()
             .unwrap(),
         ..Default::default()
-    },
+    }
 );
 ```
 
@@ -33,19 +33,11 @@ Enable the feature flag in `Cargo.toml`:
 ```toml
 [dependencies]
 pingora = { version = "0.8", features = ["sentry"] }
-sentry = "0.32"
+sentry = "0.36"
 ```
 
 <Warning>
 Sentry captures are only sent in **release builds** (`cargo build --release`). Panics that occur during development with `cargo run` (debug builds) will still isolate correctly, but they will not be forwarded to Sentry. Always validate your Sentry DSN in a staging environment built with `--release` before deploying to production.
-</Warning>
-
-## Panics in Background Services
-
-The per-request isolation described above applies only to request-handling tasks spawned by Pingora's proxy runtime. Background services — health-check loops, cache revalidation tasks, or any task you register with `background_service` — run in their own contexts and are not automatically insulated in the same way.
-
-<Warning>
-A panic in a background service task may terminate that service's runtime thread and disable the functionality it provides (for example, health checks could stop running, causing stale upstream state). Design background services to use `Result` returns and explicit error handling rather than unwrapping or asserting, so that failures are recoverable rather than fatal.
 </Warning>
 
 ## Prefer Results Over Panics

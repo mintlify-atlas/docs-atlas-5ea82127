@@ -1,7 +1,7 @@
 ---
-title: "Running Pingora as a Daemon"
+title: "Running a Pingora Server as a Background Daemon Process"
 sidebarTitle: "Daemonization"
-description: "How to run a Pingora server as a background daemon, drop privileges after bootstrap, and use pid_file to track the process."
+description: "How to daemonize a Pingora server, drop privileges after bootstrap, use pid_file for tracking, and wait for readiness before exiting the parent."
 ---
 
 Daemonization moves a Pingora server to the background after it has finished bootstrapping. The process detaches from the controlling terminal, redirects its output to a configured log file, and optionally changes its working directory and running identity. This is the standard way to deploy Pingora in production environments where a process manager or init system is in charge.

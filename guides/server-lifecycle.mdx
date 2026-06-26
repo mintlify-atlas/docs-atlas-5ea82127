@@ -1,7 +1,7 @@
 ---
-title: "Starting and Stopping a Pingora Server"
+title: "Pingora Server Lifecycle: Start, Stop, and Signals"
 sidebarTitle: "Server Lifecycle"
-description: "How to start, stop, and signal a Pingora server — including SIGINT fast shutdown, SIGTERM graceful shutdown, and SIGQUIT graceful upgrade."
+description: "How to start, stop, and signal a Pingora server process — covering SIGINT fast shutdown, SIGTERM graceful shutdown, and SIGQUIT graceful upgrade."
 ---
 
 A Pingora server is a regular, unprivileged, multithreaded process. It doesn't require a special supervisor or init system to run — it manages its own lifecycle, signal handling, and zero-downtime upgrades internally. The entry point is the `Server` struct, which owns all services, handles OS signals, and coordinates shutdown or upgrade sequences.
