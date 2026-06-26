@@ -1,0 +1,93 @@
+---
+title: "Starting and Stopping a Pingora Server"
+sidebarTitle: "Server Lifecycle"
+description: "How to start, stop, and signal a Pingora server — including SIGINT fast shutdown, SIGTERM graceful shutdown, and SIGQUIT graceful upgrade."
+---
+
+A Pingora server is a regular, unprivileged, multithreaded process. It doesn't require a special supervisor or init system to run — it manages its own lifecycle, signal handling, and zero-downtime upgrades internally. The entry point is the `Server` struct, which owns all services, handles OS signals, and coordinates shutdown or upgrade sequences.
+
+## Starting the Server
+
+The minimal bootstrap sequence is three function calls: create the server, bootstrap it, then run it forever.
+
+```rust
+use pingora::server::Server;
+use pingora::server::configuration::Opt;
+
+fn main() {
+    // Pass None to use defaults, or Opt::parse_args() to read CLI flags
+    let mut my_server = Server::new(None).unwrap();
+    my_server.bootstrap();
+    my_server.run_forever()
+}
+```
+
+By default, the server runs in the **foreground** and logs to stderr. Calling `run_forever()` blocks the current thread indefinitely — it is the last statement in `main()`. The function may fork the process when daemonization is enabled (see [Daemonization](/guides/daemonization)), so any threads you create before `run_forever()` may be lost.
+
+### Enabling CLI Argument Parsing
+
+Pass `Opt::parse_args()` to `Server::new()` to let Pingora read its standard command-line flags at startup:
+
+```rust
+use pingora::server::Server;
+use pingora::server::configuration::Opt;
+
+fn main() {
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt)).unwrap();
+    my_server.bootstrap();
+    my_server.run_forever()
+}
+```
+
+### CLI Arguments
+
+| Argument | Effect | Default |
+|---|---|---|
+| `-d`, `--daemon` | Daemonize the server (run in the background) | `false` |
+| `-t`, `--test` | Test the server configuration and then exit | `false` |
+| `-c`, `--conf` | Path to the YAML configuration file | empty string |
+| `-u`, `--upgrade` | Start as a graceful upgrade of a running server | `false` |
+
+<Note>
+The `-t` / `--test` flag is a work in progress. When set, calling `server.bootstrap()` exits the process without errors, which is useful for verifying that the new binary can start cleanly before you send SIGQUIT to the running server.
+</Note>
+
+## Stopping the Server
+
+A running Pingora process responds to three Unix signals, each with different shutdown semantics.
+
+### SIGINT — Fast Shutdown
+
+Sent by pressing **Ctrl+C** in a terminal. The server exits immediately with no delay. All in-flight requests are interrupted and their sockets are closed. This is the fastest way to stop a server but is the least graceful, because clients may receive connection resets mid-request.
+
+```bash
+# From the terminal running the server:
+^C
+# Or from another shell:
+kill -SIGINT <pid>
+```
+
+### SIGTERM — Graceful Shutdown
+
+The server notifies all its services to stop accepting new connections, then waits for a preconfigured grace period before exiting. Requests that complete within that window finish normally; any still in-flight after the timeout are interrupted.
+
+```bash
+kill -SIGTERM <pid>
+# or equivalently
+pkill -SIGTERM my_pingora_binary
+```
+
+This is the standard signal used by process managers and `systemctl stop`.
+
+### SIGQUIT — Graceful Upgrade
+
+Similar to SIGTERM in that the old server drains gracefully, but SIGQUIT also transfers all listening sockets to a newly started server instance before draining. This means the listening socket is never closed from the client's perspective, producing zero dropped connections during a binary upgrade.
+
+```bash
+kill -SIGQUIT <pid>
+# or
+pkill -SIGQUIT my_pingora_binary
+```
+
+See the [Graceful Upgrade](/guides/graceful-upgrade) guide for the full step-by-step procedure.

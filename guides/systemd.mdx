@@ -1,0 +1,65 @@
+---
+title: "Running Pingora Under systemd"
+sidebarTitle: "systemd"
+description: "Configure systemd service units to manage Pingora server lifecycle, including socket activation and graceful restart on binary update."
+---
+
+Pingora does not depend on systemd, but it integrates naturally with it. Because Pingora handles its own daemonization, PID tracking, and graceful upgrade signalling, you only need a small service unit to wire everything together. The result is a fully managed service that supports `systemctl start`, `systemctl stop`, and — most usefully — `systemctl reload` for zero-downtime binary upgrades.
+
+## Service Unit
+
+The following unit file configures systemd to manage a Pingora server. It uses `Type=forking` because Pingora daemonizes itself (the parent exits after the fork), and `PIDFile` so that systemd can track the background process and send signals to the correct PID.
+
+```ini
+[Service]
+Type=forking
+PIDFile=/run/pingora.pid
+ExecStart=/bin/pingora -d -c /etc/pingora.conf
+ExecReload=kill -QUIT $MAINPID
+ExecReload=/bin/pingora -u -d -c /etc/pingora.conf
+```
+
+Save this as `/etc/systemd/system/pingora.service`, then enable and start it:
+
+```bash
+systemctl daemon-reload
+systemctl enable --now pingora.service
+```
+
+## How `systemctl reload` Works
+
+The `ExecReload` directive runs two commands in sequence when you call `systemctl reload pingora.service`:
+
+1. **`kill -QUIT $MAINPID`** — sends SIGQUIT to the running Pingora process. The old instance starts transferring its listening socket file descriptors to the upgrade socket path configured in `/etc/pingora.conf`.
+2. **`/bin/pingora -u -d -c /etc/pingora.conf`** — launches the new binary with the `--upgrade` flag. It connects to the upgrade socket, receives the file descriptors, and immediately begins serving traffic. The old instance drains and exits.
+
+From systemd's perspective this is an ordinary reload. From the client's perspective no connections are dropped.
+
+To trigger a reload after installing a new binary:
+
+```bash
+systemctl reload pingora.service
+```
+
+<Tip>
+Add `daemon_wait_for_ready: true` to your configuration file so that the parent process (launched by `ExecReload`) waits for the new daemon to finish bootstrapping before it exits. This prevents systemd from sending SIGQUIT to the old instance before the new one is ready to handle traffic, ensuring a truly seamless handover.
+
+```yaml
+---
+version: 1
+daemon: true
+daemon_wait_for_ready: true
+pid_file: /run/pingora.pid
+upgrade_sock: /tmp/pingora_upgrade.sock
+```
+</Tip>
+
+## Stopping the Service
+
+Use `systemctl stop` to send SIGTERM and trigger a graceful shutdown:
+
+```bash
+systemctl stop pingora.service
+```
+
+Pingora will stop accepting new connections, wait for the configured grace period, and then exit cleanly. The PID file is removed automatically by the server on exit.

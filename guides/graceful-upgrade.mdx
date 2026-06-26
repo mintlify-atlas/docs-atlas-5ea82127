@@ -1,0 +1,95 @@
+---
+title: "Graceful Zero-Downtime Binary Upgrade"
+sidebarTitle: "Graceful Upgrade"
+description: "Upgrade a running Pingora server binary with zero dropped connections using the SIGQUIT signal and --upgrade flag."
+---
+
+Pingora's graceful upgrade mechanism lets you replace a running server binary without interrupting any in-flight HTTP connections. From the client's perspective the listening socket never closes — there is no window during which a connection attempt would be refused.
+
+The mechanism provides two hard guarantees:
+
+- **No connection refused.** Every new connection attempt is handled by either the old server instance or the new one. There is no gap.
+- **In-flight requests complete.** Any request that can finish within the configured grace period is guaranteed not to be terminated mid-flight.
+
+<Note>
+The socket-transfer mechanism relies on Unix domain socket file-descriptor passing and is **Linux only**. It is not available on macOS or Windows.
+</Note>
+
+<Note>
+Graceful upgrade (SIGQUIT) is distinct from graceful shutdown (SIGTERM). SIGTERM drains the server and exits; SIGQUIT transfers sockets to a new instance first, then drains. Both use the same grace period logic for in-flight requests.
+</Note>
+
+## Prerequisites
+
+You need a shared `upgrade_sock` path that both the old and new server instances agree on. This path must be set in the configuration file **before** you start the old server for the first time:
+
+```yaml
+---
+version: 1
+upgrade_sock: /tmp/pingora_upgrade.sock
+```
+
+## Upgrade Procedure
+
+<Steps>
+
+### Configure the upgrade socket
+
+Add `upgrade_sock` to your configuration file. Both the old and new instances must point to the same path. The YAML shown above is the canonical example.
+
+### Compile the new binary
+
+Build the replacement binary using your normal build process:
+
+```bash
+cargo build --release
+```
+
+### Start the new instance with `--upgrade`
+
+Launch the new binary with the `-u` / `--upgrade` flag. Instead of binding to the listening ports immediately, the new instance connects to the upgrade socket and **waits** for the old instance to hand over the file descriptors:
+
+```bash
+RUST_LOG=INFO ./target/release/my_pingora_server -u -d -c /etc/pingora.conf
+```
+
+The new process blocks in its bootstrap phase at this point. No traffic is served yet.
+
+### Send SIGQUIT to the old instance
+
+Signal the old server to begin the handover:
+
+```bash
+pkill -SIGQUIT my_pingora_server
+# Or using the pid file:
+kill -SIGQUIT $(cat /run/pingora.pid)
+```
+
+The old instance transfers its listening socket file descriptors to the new instance over the upgrade socket. The new instance immediately begins accepting connections on those sockets. Meanwhile, the old instance stops accepting new connections, waits a short period (to give the new instance time to initialize and start handling traffic), and then enters its graceful shutdown drain — waiting for the grace period before exiting.
+
+</Steps>
+
+## Combined Command
+
+For a quick local upgrade (e.g., during development), you can run both steps together:
+
+```bash
+pkill -SIGQUIT load_balancer && RUST_LOG=INFO cargo run -- -c conf.yaml -d -u
+```
+
+This sends SIGQUIT to the old process and immediately launches the new one with `--upgrade`, relying on the upgrade socket to synchronize the handover.
+
+## What the Client Sees
+
+The listening socket (e.g., TCP port 443) is owned by the operating system, not the process. When the old instance transfers the socket file descriptor to the new instance, the OS-level socket object never closes. Any new `connect()` calls from clients are queued in the kernel and served by the new instance as soon as it takes ownership. Clients that were already connected to the old instance continue to be served by it during the drain period.
+
+## Old Instance Drain Behavior
+
+After handing off the socket file descriptors, the old instance:
+
+1. Waits a short fixed period (`CLOSE_TIMEOUT`, 5 seconds by default) to give the new process time to initialize and prepare to handle traffic.
+2. Stops accepting any new connections.
+3. Waits up to the configured grace period (`EXIT_TIMEOUT`, 5 minutes by default) for all in-flight requests to finish.
+4. Exits.
+
+If a request is still in-flight after the grace period expires, it is interrupted and the socket is closed.

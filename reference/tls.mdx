@@ -1,0 +1,229 @@
+---
+title: "TLS Configuration: OpenSSL, BoringSSL, s2n-tls, and rustls"
+sidebarTitle: "TLS"
+description: "Configure TLS in Pingora using one of four providers — OpenSSL, BoringSSL (FIPS), s2n-tls, or experimental rustls — with mTLS and PSK support."
+---
+
+Pingora's TLS support is fully pluggable. The framework ships four distinct TLS providers behind a uniform API: OpenSSL, BoringSSL, AWS s2n-tls, and an experimental pure-Rust rustls backend. You select the provider at compile time via a Cargo feature flag. Regardless of which provider you choose, the rest of your application code — `HttpPeer` configuration, connection pooling, mTLS — works identically.
+
+<Warning>
+Only **one** TLS provider feature can be selected at a time. Enabling more than one (`openssl`, `boringssl`, `s2n`, or `rustls`) in the same build is not supported and will produce a compile error.
+</Warning>
+
+---
+
+## Choosing a TLS Provider
+
+<Tabs>
+  <Tab title="OpenSSL">
+    The default and most widely deployed option. Uses the native `openssl` crate which links against the system's OpenSSL shared library.
+
+    ```toml
+    [dependencies]
+    pingora = { version = "0.8.0", features = ["openssl", "proxy"] }
+    ```
+
+    **Build requirements:** Perl 5 must be installed (used by the OpenSSL build system). The system must have OpenSSL development headers available.
+
+    Internally this activates `pingora-openssl`, which re-exports the `openssl`, `openssl-sys`, and `tokio-openssl` crates under a compatible namespace.
+  </Tab>
+  <Tab title="BoringSSL">
+    Google's BoringSSL fork used by Cloudflare internally. Provides FIPS-validated cryptography and is the recommended choice for regulated environments.
+
+    ```toml
+    [dependencies]
+    pingora = { version = "0.8.0", features = ["boringssl", "proxy"] }
+    ```
+
+    **Build requirements:** Clang must be installed.
+
+    `pingora-boringssl` exposes an API surface that is intentionally identical to `pingora-openssl`, so you can swap between the two by changing only the Cargo feature.
+
+    <Tip>
+    BoringSSL is FIPS-compatible and is the TLS implementation used by Cloudflare's own production proxy infrastructure. If your deployment environment requires FIPS 140-2/140-3 compliance, `boringssl` is the appropriate choice.
+    </Tip>
+  </Tab>
+  <Tab title="s2n-tls">
+    AWS's s2n-tls library. Supports pre-shared keys (PSK), configurable security policies, and advanced options such as `max_blinding_delay` to mitigate timing side-channels.
+
+    ```toml
+    [dependencies]
+    pingora = { version = "0.8.0", features = ["s2n", "proxy"] }
+    ```
+
+    **Build requirements:** The native s2n-tls library and its build tooling must be available.
+
+    s2n-tls-specific options are gated behind `#[cfg(feature = "s2n")]` in `PeerOptions` and are ignored when a different TLS provider is selected.
+  </Tab>
+  <Tab title="rustls (experimental)">
+    A pure-Rust TLS implementation with no native library dependencies.
+
+    ```toml
+    [dependencies]
+    pingora = { version = "0.8.0", features = ["rustls", "proxy"] }
+    ```
+
+    <Warning>
+    rustls support in Pingora is **highly experimental** and is not ready for production use. The API and behaviour may change significantly in future releases.
+    </Warning>
+  </Tab>
+</Tabs>
+
+---
+
+## Build Requirements
+
+| Provider | Required tooling |
+|---|---|
+| `openssl` | Perl 5 (for the OpenSSL build system); OpenSSL development headers |
+| `boringssl` | Clang |
+| `s2n` | Native s2n-tls library and its build tooling |
+| `rustls` | No additional tooling required |
+
+---
+
+## TLS in `HttpPeer`
+
+`HttpPeer` is the primary way to configure TLS for outbound (upstream) connections. The `sni` field enables TLS; leaving it empty means a plain TCP connection.
+
+```rust
+use pingora::prelude::HttpPeer;
+
+// HTTPS with SNI and certificate verification
+let peer = HttpPeer::new("1.1.1.1:443", true, "one.one.one.one".to_string());
+```
+
+The detailed TLS behaviour is controlled through `peer.options` (a `PeerOptions` struct):
+
+```rust
+// Disable certificate verification (not recommended for production)
+peer.options.verify_cert = false;
+
+// Disable hostname verification separately
+peer.options.verify_hostname = false;
+
+// Supply a custom CA bundle instead of the system trust store
+peer.options.ca = Some(my_ca_arc);
+
+// Override the ALPN protocols advertised during TLS handshake
+peer.options.alpn = pingora::protocols::ALPN::H1;
+
+// Specify the TLS curves to advertise
+peer.options.curves = Some(std::borrow::Cow::Borrowed("X25519:P-256"));
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `verify_cert` | `bool` | `true` | Verify the upstream's certificate against the CA bundle |
+| `verify_hostname` | `bool` | `true` | Verify the upstream's hostname matches the certificate CN/SAN |
+| `alternative_cn` | `Option<String>` | `None` | Accept the cert if its CN matches this name instead of the SNI |
+| `ca` | `Option<Arc<CaType>>` | `None` | Custom CA certificate(s); uses system trust store when `None` |
+| `curves` | `Option<Cow<'static, str>>` | `None` | Colon-separated list of TLS curves to advertise |
+| `second_keyshare` | `bool` | `false` | Enable `ssl_use_second_key_share` |
+
+---
+
+## mTLS (Mutual TLS)
+
+To authenticate the proxy as a client to an upstream, set `client_cert_key` on the `HttpPeer`:
+
+```rust
+use std::sync::Arc;
+use pingora::tls::CertKey;
+
+// Load a certificate and private key from PEM files
+let cert_key = CertKey::from_pem_file("client.crt", "client.key")?;
+
+let mut peer = HttpPeer::new("upstream:443", true, "upstream.example.com".to_string());
+peer.client_cert_key = Some(Arc::new(cert_key));
+```
+
+Or use the constructor shorthand:
+
+```rust
+let peer = HttpPeer::new_mtls(
+    "upstream:443",
+    "upstream.example.com".to_string(),
+    Arc::new(cert_key),
+);
+```
+
+---
+
+## s2n-tls Specific Options
+
+When the `s2n` feature is active, `PeerOptions` gains several additional fields:
+
+```rust
+#[cfg(feature = "s2n")]
+pub use_system_certs: bool,       // Use the system certificate store (default: true)
+
+#[cfg(feature = "s2n")]
+pub psk: Option<Arc<PskType>>,    // Pre-shared keys for TLS 1.3 PSK connections
+
+#[cfg(feature = "s2n")]
+pub s2n_security_policy: Option<S2NPolicy>,  // Named s2n security policy
+
+#[cfg(feature = "s2n")]
+pub max_blinding_delay: Option<u32>, // Max blinding delay (ms) to mitigate timing attacks
+```
+
+### Pre-Shared Keys (PSK)
+
+PSK allows two parties that share a secret to authenticate without certificates, useful for service-to-service communication in controlled environments:
+
+```rust
+#[cfg(feature = "s2n")]
+{
+    use pingora::upstreams::peer::PskType;
+    let psk = PskType {
+        keys: vec![PskKey {
+            identity: b"my-psk-id".to_vec(),
+            secret: b"my-secret-key-32-bytes-minimum!!".to_vec(),
+        }],
+    };
+    peer.options.psk = Some(Arc::new(psk));
+}
+```
+
+### Security Policy
+
+s2n-tls security policies bundle together TLS version requirements, cipher suites, and signature algorithms under a named policy string:
+
+```rust
+#[cfg(feature = "s2n")]
+{
+    peer.options.s2n_security_policy = Some("default_tls13".into());
+}
+```
+
+Refer to the [s2n-tls security policies documentation](https://github.com/aws/s2n-tls/blob/main/docs/USAGE-GUIDE.md#security-policies) for available policy names.
+
+### The `s2n_config_cache_size` server configuration
+
+The global `ServerConf` also exposes an `s2n_config_cache_size` field that controls how many distinct s2n configurations are cached internally. Creating a new s2n config is expensive, so caching reduces handshake latency when many different TLS settings are in use concurrently.
+
+---
+
+## Downstream TLS (Server Certificates)
+
+To terminate TLS on the listening side of your proxy, configure the `Listeners` with a TLS acceptor. This is set up per-service when building the `Server`:
+
+```rust
+use pingora::server::Server;
+use pingora::listeners::TlsSettings;
+
+let mut server = Server::new(None).unwrap();
+
+// Load server certificate and private key
+let mut tls_settings = TlsSettings::intermediate("server.crt", "server.key")
+    .expect("failed to load TLS certificate");
+
+// Optional: enable client certificate verification for downstream mTLS
+// tls_settings.enable_mtls(&ca_cert_path);
+
+let mut service = my_http_proxy_service();
+service.add_tcp_with_tls("0.0.0.0:443", &tls_settings);
+```
+
+TLS settings for downstream listeners are configured via the `TlsSettings` builder, which provides preset security levels (`intermediate`, `modern`) aligned with Mozilla's recommended configurations.

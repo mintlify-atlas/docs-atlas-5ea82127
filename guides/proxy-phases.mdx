@@ -1,0 +1,399 @@
+---
+title: "ProxyHttp Lifecycle: Phases and Filter Callbacks"
+sidebarTitle: "Proxy Phases"
+description: "Every phase in the Pingora proxy request lifecycle — from early_request_filter through logging — with when to use each and how they interact."
+---
+
+The `ProxyHttp` trait is the central API of `pingora-proxy`. Rather than exposing a single monolithic request handler, it structures request processing as a sequence of named **phases** — each representing a meaningful moment in the life of a proxied HTTP request. By implementing only the phases you need, you insert custom logic precisely where it matters: before connecting upstream, after receiving a response header, when an error occurs, and so on. Every other phase defaults to a no-op, so you pay only for what you use.
+
+## Life of a Request
+
+Every proxied HTTP request passes through up to five major stages:
+
+<Steps>
+  <Step title="Read downstream request">
+    The proxy reads the HTTP request header from the **downstream** (the client). This triggers `early_request_filter` and `request_filter`.
+  </Step>
+  <Step title="Connect to upstream">
+    The proxy establishes a connection to the **upstream** (the remote server), using the `HttpPeer` returned by `upstream_peer()`. This step is skipped when a pooled connection can be reused.
+  </Step>
+  <Step title="Send request upstream">
+    The proxy sends the request header (and body, if any) to the upstream. `upstream_request_filter` fires here, allowing last-minute header manipulation.
+  </Step>
+  <Step title="Duplex proxy">
+    The proxy enters a bidirectional mode: it simultaneously streams the upstream response (header + body) to the downstream and forwards any downstream request body to the upstream. The `upstream_response_*` and `response_*` filter families run here.
+  </Step>
+  <Step title="End and recycle">
+    Once the full request/response cycle completes, all resources are released. Both the downstream and upstream connections are returned to their respective connection pools for reuse, where applicable. The `logging` phase fires here.
+  </Step>
+</Steps>
+
+## Phase Reference
+
+The diagram below shows how phases connect to one another, including retry and error paths:
+
+```
+new request
+  → early_request_filter
+  → request_filter ──────────────────────────────────────────► logging
+  → upstream_peer
+  → [IO: connect to upstream]
+      ├─ success → connected_to_upstream
+      │              → upstream_request_filter
+      │              → request_body_filter
+      │              → [IO: send request / read response]
+      │                  ├─ feature → adjust_upstream_modules
+      │                  → upstream_response_filter
+      │                  → response_filter
+      │                  → upstream_response_body_filter
+      │                  → response_body_filter
+      │                  → logging
+      │
+      └─ failure → fail_to_connect
+                     ├─ retry → upstream_peer (loop)
+                     └─ no retry → fail_to_proxy → logging
+
+IO error / filter error → error_while_proxy
+  ├─ retry → upstream_peer (loop)
+  └─ no retry → fail_to_proxy → logging
+```
+
+<Note>
+`upstream_peer()` is the **only required method** in the `ProxyHttp` trait. All other phases have default no-op implementations and are optional.
+</Note>
+
+### General Guidelines
+
+- Most filters return a `pingora_error::Result<_>`. When the returned value is `Err`, `fail_to_proxy()` is called and the request is terminated.
+- All filters are `async`, allowing IO or other async work inside a phase without blocking other requests.
+- A per-request `CTX` object is passed to every filter, enabling state sharing across phases within a single request.
+- Most filters are optional and default to a no-op.
+- Both `upstream_response_*_filter()` and `response_*_filter()` exist for HTTP caching integration: the `upstream_*` variants fire before cache writes, the plain variants fire before sending to the downstream.
+
+<AccordionGroup>
+
+  <Accordion title="early_request_filter">
+
+**What it is:** The very first phase of every request, running before any downstream module logic.
+
+**When it runs:** Before `request_filter` and before any module (rate limiter, access control, etc.) processes the request.
+
+**What you can do:** Configure module behavior at the finest granularity — for example, enabling or disabling a specific module for this request before it has a chance to run.
+
+**Return value:** `Result<()>`. An `Err` terminates the request.
+
+**Caution:** Because this runs before access control and rate-limiting modules, any security-sensitive logic should remain in `request_filter()` instead, where it will be protected by those modules.
+
+```rust
+async fn early_request_filter(
+    &self,
+    session: &mut Session,
+    ctx: &mut Self::CTX,
+) -> Result<()>
+where
+    Self::CTX: Send + Sync,
+{
+    Ok(())
+}
+```
+
+  </Accordion>
+
+  <Accordion title="request_filter">
+
+**What it is:** The primary early-request phase for validation, rate limiting, and access control.
+
+**When it runs:** After `early_request_filter`, before any upstream connection is established.
+
+**What you can do:** Parse and validate request headers and paths, apply rate limiting, perform authentication checks, initialize `CTX` values, or write a response directly and short-circuit the proxy.
+
+**Return value:** `Result<bool>`. Return `Ok(true)` if you have already written a response and the proxy should stop; return `Ok(false)` to continue processing.
+
+```rust
+async fn request_filter(
+    &self,
+    session: &mut Session,
+    ctx: &mut Self::CTX,
+) -> Result<bool>
+where
+    Self::CTX: Send + Sync,
+{
+    Ok(false)
+}
+```
+
+  </Accordion>
+
+  <Accordion title="request_body_filter">
+
+**What it is:** A streaming filter called each time a chunk of the downstream request body is received.
+
+**When it runs:** After `upstream_request_filter`, while the request body is being forwarded upstream. Called once per received body chunk — not once for the entire body.
+
+**What you can do:** Inspect or transform each body chunk, throttle upload speed, or run expensive logic (such as WAF rules) on a background thread without blocking the event loop.
+
+**Return value:** `Result<()>`. An `Err` terminates the request.
+
+```rust
+async fn request_body_filter(
+    &self,
+    session: &mut Session,
+    body: &mut Option<Bytes>,
+    end_of_stream: bool,
+    ctx: &mut Self::CTX,
+) -> Result<()>
+where
+    Self::CTX: Send + Sync,
+```
+
+  </Accordion>
+
+  <Accordion title="proxy_upstream_filter">
+
+**What it is:** A gate that decides whether the request should proceed to the upstream.
+
+**When it runs:** After `request_filter`, before `upstream_peer()` selects an upstream. This is especially useful when caching is enabled — it lets you defer expensive checks (rate limiting, access control) until after a cache miss.
+
+**What you can do:** Return `Ok(true)` to continue to the upstream; return `Ok(false)` if you have already written a response (a 502 is sent by default if you return `false` without writing a response).
+
+**Return value:** `Result<bool>`.
+
+  </Accordion>
+
+  <Accordion title="upstream_peer (required)">
+
+**What it is:** Selects which upstream server to connect to and how.
+
+**When it runs:** After `proxy_upstream_filter`, and again on each retry.
+
+**What you can do:** Implement any routing logic — DNS lookup, consistent hashing, round-robin, path-based routing, header-based routing, or failover. Return a `Box<HttpPeer>` that encodes the target address, TLS settings, timeouts, and more.
+
+**Return value:** `Result<Box<HttpPeer>>`. This is the only phase you **must** implement.
+
+```rust
+async fn upstream_peer(
+    &self,
+    session: &mut Session,
+    ctx: &mut Self::CTX,
+) -> Result<Box<HttpPeer>>;
+```
+
+  </Accordion>
+
+  <Accordion title="connected_to_upstream">
+
+**What it is:** Called when a connection to the upstream is successfully established (or reused from the pool).
+
+**When it runs:** Immediately after the upstream connection succeeds, before the request is sent.
+
+**What you can do:** Log connection timing, record TLS cipher/version information, emit metrics, or store the connection type in `CTX`.
+
+**Return value:** `Result<()>`.
+
+```rust
+async fn connected_to_upstream(
+    &self,
+    session: &mut Session,
+    reused: bool,
+    peer: &HttpPeer,
+    fd: RawFd,          // unix
+    digest: Option<&Digest>,
+    ctx: &mut Self::CTX,
+) -> Result<()>
+where
+    Self::CTX: Send + Sync,
+```
+
+  </Accordion>
+
+  <Accordion title="fail_to_connect">
+
+**What it is:** Called when the proxy fails to establish a connection to the upstream.
+
+**When it runs:** When the TCP/TLS connection attempt to the upstream fails.
+
+**What you can do:** Log or report the error (to Sentry, Prometheus, etc.). Critically, you can call `e.set_retry(true)` to mark the error as retry-able. If retry is set, `upstream_peer()` will be called again — at which point your `CTX` can direct it to a different upstream for failover.
+
+**Return value:** `Box<Error>` — the (possibly modified) error.
+
+```rust
+fn fail_to_connect(
+    &self,
+    session: &mut Session,
+    peer: &HttpPeer,
+    ctx: &mut Self::CTX,
+    e: Box<Error>,
+) -> Box<Error> {
+    e
+}
+```
+
+  </Accordion>
+
+  <Accordion title="upstream_request_filter">
+
+**What it is:** A filter to modify the request header before it is sent upstream.
+
+**When it runs:** After the upstream connection is established and the connection policy (hop-by-hop stripping) has been applied, but before the request is sent.
+
+**What you can do:** Add, remove, or modify request headers that the upstream should see. Headers added here are treated as application-controlled — including framing headers like `Content-Length` and upgrade fields.
+
+**Return value:** `Result<()>`.
+
+```rust
+async fn upstream_request_filter(
+    &self,
+    session: &mut Session,
+    upstream_request: &mut RequestHeader,
+    ctx: &mut Self::CTX,
+) -> Result<()>
+where
+    Self::CTX: Send + Sync,
+```
+
+  </Accordion>
+
+  <Accordion title="adjust_upstream_modules (feature-gated)">
+
+**What it is:** A filter to configure upstream modules before they process the response header.
+
+**When it runs:** When the upstream response header arrives, before upstream modules (e.g., `upstream_compression`) run their own header filter. May be called more than once if the upstream sends informational (1xx) headers before the final response.
+
+**What you can do:** Set module-specific configuration based on the response — for example, providing a dictionary for dictionary-based content encoding. Check `upstream_response.status.is_informational()` to distinguish 1xx headers from the final response.
+
+**Note:** This is an **immutable** reference to the response header. To modify the response header itself, use `upstream_response_filter()` instead.
+
+**Feature flag:** Requires the `upstream_modules` feature.
+
+**Return value:** `Result<()>`.
+
+  </Accordion>
+
+  <Accordion title="upstream_response_filter / upstream_response_body_filter / upstream_response_trailer_filter">
+
+**What they are:** A family of filters that fire when the upstream response header, body chunks, and trailers are received — **before** HTTP caching writes the response.
+
+**When they run:** As each piece of the upstream response arrives. Changes made here are stored in the HTTP cache (if caching is enabled).
+
+**What you can do:**
+- `upstream_response_filter`: Add, remove, or modify upstream response headers.
+- `upstream_response_body_filter`: Inspect or transform each body chunk; return an `Option<Duration>` to throttle.
+- `upstream_response_trailer_filter`: Modify upstream trailers.
+
+**Return value:** `Result<()>` (header/trailers), `Result<Option<Duration>>` (body — optional throttle delay).
+
+  </Accordion>
+
+  <Accordion title="response_filter / response_body_filter / response_trailer_filter">
+
+**What they are:** The downstream-facing counterparts to the `upstream_response_*` family. These run after caching and are called for every response, including ones served from cache.
+
+**When they run:** Before the response header, body chunks, and trailers are sent to the downstream client.
+
+**What you can do:**
+- `response_filter`: Final chance to set or remove response headers before the client sees them.
+- `response_body_filter`: Transform body chunks or throttle delivery.
+- `response_trailer_filter`: Modify trailers; an `Ok(Some(Bytes))` value is written as body bytes instead.
+
+**Return value:** `Result<()>` (header), `Result<Option<Duration>>` (body), `Result<Option<Bytes>>` (trailers).
+
+  </Accordion>
+
+  <Accordion title="error_while_proxy">
+
+**What it is:** Called when an IO error or filter error occurs **after** an upstream connection is established.
+
+**When it runs:** When a read or write error occurs while streaming data between the upstream and downstream, or when any response filter returns an `Err`.
+
+**What you can do:** Inspect the error, add context, and decide whether to retry. The default implementation automatically allows retries on reused connections (where the remote end may have dropped an idle connection) as long as the retry buffer has not been truncated.
+
+**Return value:** `Box<Error>`.
+
+**Safety:** Only retry idempotent methods (GET, HEAD, etc.) from this phase. If a POST has already been sent to the upstream, retrying may have side effects.
+
+  </Accordion>
+
+  <Accordion title="fail_to_proxy">
+
+**What it is:** The universal error handler — called whenever any phase produces a fatal error.
+
+**When it runs:** When a non-retryable error reaches the top level, after all retry attempts are exhausted.
+
+**What you can do:** Log the error, report it to external systems, and optionally write a custom error response to the downstream. The default implementation sends an HTTP error response based on the error type (502 for upstream errors, 500 for internal errors, 400/0 for downstream errors).
+
+**Return value:** `FailToProxy` (contains `error_code` and `can_reuse_downstream`).
+
+  </Accordion>
+
+  <Accordion title="logging">
+
+**What it is:** The final phase of every request — runs regardless of whether the request succeeded or failed.
+
+**When it runs:** After the full request/response cycle completes (or after `fail_to_proxy`), before resources are released.
+
+**What you can do:** Emit access logs, increment Prometheus counters, flush trace spans, or perform any post-request cleanup. The `session.response_written()` method reports the status code that was actually sent.
+
+**Return value:** `()` (infallible — errors here are not propagated).
+
+```rust
+async fn logging(
+    &self,
+    session: &mut Session,
+    e: Option<&Error>,
+    ctx: &mut Self::CTX,
+)
+where
+    Self::CTX: Send + Sync,
+```
+
+  </Accordion>
+
+</AccordionGroup>
+
+## Callbacks
+
+Beyond the phase filters, `ProxyHttp` provides three callbacks that influence logging behavior:
+
+### `request_summary()`
+
+This callback is invoked whenever an error reaches `fail_to_proxy()` and needs to be written to the error log. It returns a `String` that is appended to the log entry, letting you include request-specific context — such as the request ID, user agent, or path — to aid debugging.
+
+```rust
+fn request_summary(&self, session: &Session, ctx: &Self::CTX) -> String {
+    session.as_ref().request_summary()
+}
+```
+
+### `suppress_error_log()`
+
+Every error that flows through `fail_to_proxy()` is automatically written to the error log. This callback lets you suppress specific errors — for example, silencing `ConnectionClosed` errors from downstream clients that disconnect early, which can otherwise flood the log.
+
+Return `true` to suppress the log entry; `false` (the default) to allow it.
+
+```rust
+fn suppress_error_log(
+    &self,
+    session: &Session,
+    ctx: &Self::CTX,
+    error: &Error,
+) -> bool {
+    false
+}
+```
+
+### `suppress_proxy_warn_log()` _(experimental)_
+
+Similar to `suppress_error_log()`, but targets proxy warning logs that do not reach `fail_to_proxy()` — such as retryable upstream failures or downstream errors ignored while a cache fill continues. The callback receives a `ProxyWarnLogContext` so you can distinguish these contexts:
+
+```rust
+pub enum ProxyWarnLogContext {
+    /// A proxy upstream attempt failed with a retryable error.
+    UpstreamRetry,
+    /// A downstream error was ignored so cache fill could continue.
+    DownstreamCache,
+}
+```
+
+<Warning>
+`suppress_proxy_warn_log` is **experimental** and may change or be removed without notice. Suppressing retry warning logs removes the only per-retry audit record — if you suppress these, provide alternative observability (metrics or custom logs from within this callback).
+</Warning>

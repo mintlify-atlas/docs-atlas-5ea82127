@@ -1,0 +1,73 @@
+---
+title: "Connection Pooling and Reuse in Pingora"
+sidebarTitle: "Connection Pooling"
+description: "How Pingora automatically pools and reuses upstream connections, what makes two peers identical for pooling, and how to disable pooling per-peer."
+---
+
+Establishing a new TCP connection — and especially a TLS connection — adds meaningful latency to every request. The TCP handshake alone requires a round trip; TLS adds another one or two. At any significant scale these costs compound into substantial overhead. Pingora eliminates this overhead automatically: when a request to an upstream server completes, the connection is placed in a pool keyed by the upstream's identity. The next request to the same upstream picks up that connection from the pool and proceeds directly to sending the request, skipping the handshake entirely.
+
+This happens with no special configuration. The pool is maintained per Pingora worker thread and connections are transparently recycled. The result is lower latency, reduced CPU usage (fewer cryptographic handshakes), and higher throughput on the same hardware.
+
+<Tip>
+Connection reuse is particularly impactful for TLS upstreams. A TLS 1.3 handshake involves two round trips before any application data is exchanged. Reusing a connection drops that cost to zero for every subsequent request to the same peer.
+</Tip>
+
+## Peer Identity for Pooling
+
+Only connections to the **exact same peer** are reusable. Pingora determines peer identity by comparing all of the following attributes. If every attribute matches, an existing pooled connection can be reused; if any attribute differs, a new connection is established.
+
+| Attribute | Why it matters for pooling |
+|-----------|---------------------------|
+| **IP:port** | Connections are to a specific server instance |
+| **Scheme** | HTTP and HTTPS connections are not interchangeable |
+| **SNI** | Different SNI values may reach different virtual hosts on the same IP |
+| **Client certificate** | mTLS connections are bound to a specific client identity |
+| **verify_cert** | A connection with certificate verification disabled is not safe to reuse for a request that requires verification |
+| **verify_hostname** | Same reasoning as verify_cert |
+| **alternative_cn** | Part of the TLS identity — different CN acceptance means different security posture |
+| **Proxy settings** | Connections routed through different CONNECT proxies are physically distinct |
+
+This comparison is conservative by design: Pingora never reuses a connection where doing so could compromise correctness or security.
+
+## Disabling Pooling
+
+To opt out of connection pooling for a specific peer, set `idle_timeout` to zero in `PeerOptions`. A connection with an idle timeout of zero is never added to the pool after use — it is closed immediately when the request completes.
+
+```rust
+async fn upstream_peer(
+    &self,
+    _session: &mut Session,
+    _ctx: &mut Self::CTX,
+) -> Result<Box<HttpPeer>> {
+    let mut peer = Box::new(HttpPeer::new(
+        ("backend.internal", 443),
+        true,
+        "backend.internal".to_string(),
+    ));
+    // Disable connection pooling for this peer
+    peer.options.idle_timeout = Some(Duration::from_secs(0));
+    Ok(peer)
+}
+```
+
+This is useful for upstreams where connection reuse is unsafe or undesirable — for example, when each request requires a fresh TLS session for audit reasons, or when the upstream is known to have a very short idle timeout itself.
+
+## Pool Size Configuration
+
+The maximum number of idle connections held in the pool per-thread is controlled by `upstream_keepalive_pool_size` in Pingora's server configuration YAML:
+
+```yaml
+upstream_keepalive_pool_size: 128
+```
+
+The default value is sufficient for many deployments. Increase it if your proxy fans out to a large number of distinct upstream peers and you observe a high rate of new connection establishment in metrics.
+
+## Connection Reuse Failure
+
+<Note>
+A connection is marked as **not reusable** if any error occurs during the request that uses it. This prevents a half-open or corrupted connection from being returned to the pool and given to a future request.
+</Note>
+
+When `error_while_proxy()` is called, the connection is discarded rather than pooled. If the error was on a *previously* reused connection (i.e., the upstream dropped an idle connection before the proxy could use it), the default implementation of `error_while_proxy()` automatically marks the error as retryable — allowing Pingora to establish a fresh connection and retry the request transparently, provided the downstream has not yet received any response bytes.
+
+This means transient "connection reset on reuse" failures are typically handled automatically and invisibly to the downstream client.

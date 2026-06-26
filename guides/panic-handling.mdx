@@ -1,0 +1,81 @@
+---
+title: "Handling Panics in Pingora Services"
+sidebarTitle: "Panic Handling"
+description: "How Pingora catches and handles panics in request processing — isolating panics per request so a single panic does not crash the whole server."
+---
+
+One of the reliability properties of Pingora is that a panic occurring during the processing of one request does not affect any other request in flight, nor does it bring down the server. Pingora runs request handlers inside the Tokio asynchronous runtime, which catches panics at the task boundary and converts them into task termination rather than process termination. The result is that a rogue panic is isolated to the single request that triggered it: the socket acquired for that request is dropped (closed), the client receives a connection reset, and every other request continues unaffected.
+
+## How Panic Isolation Works
+
+When a panic unwinds through a request-handling task, Tokio captures it and terminates that task. Pingora does not attempt to recover state from the panicking task — it simply discards it. Any resources held exclusively by that task (TCP sockets, acquired upstream connections) are released through normal Rust drop semantics as the task unwinds.
+
+From the client's perspective, the connection is closed abruptly. From the server's perspective, the event is invisible to other tasks: they continue running, accepting new connections, and processing their own requests without interruption.
+
+## Monitoring Panics with Sentry
+
+Although panics are not fatal, they represent unexpected logic errors that should be investigated. Pingora has built-in [Sentry](https://sentry.io/) integration to capture and report panics automatically. To enable it, pass a `ClientOptions` value to `set_sentry_config` before starting the server:
+
+```rust
+#[cfg(feature = "sentry")]
+my_server.set_sentry_config(
+    sentry::ClientOptions {
+        dsn: "https://your-dsn@sentry.io/project-id"
+            .into_dsn()
+            .unwrap(),
+        ..Default::default()
+    },
+);
+```
+
+Enable the feature flag in `Cargo.toml`:
+
+```toml
+[dependencies]
+pingora = { version = "0.8", features = ["sentry"] }
+sentry = "0.32"
+```
+
+<Warning>
+Sentry captures are only sent in **release builds** (`cargo build --release`). Panics that occur during development with `cargo run` (debug builds) will still isolate correctly, but they will not be forwarded to Sentry. Always validate your Sentry DSN in a staging environment built with `--release` before deploying to production.
+</Warning>
+
+## Panics in Background Services
+
+The per-request isolation described above applies only to request-handling tasks spawned by Pingora's proxy runtime. Background services — health-check loops, cache revalidation tasks, or any task you register with `background_service` — run in their own contexts and are not automatically insulated in the same way.
+
+<Warning>
+A panic in a background service task may terminate that service's runtime thread and disable the functionality it provides (for example, health checks could stop running, causing stale upstream state). Design background services to use `Result` returns and explicit error handling rather than unwrapping or asserting, so that failures are recoverable rather than fatal.
+</Warning>
+
+## Prefer Results Over Panics
+
+Even though Pingora's runtime provides a safety net for request-level panics, panics should be reserved for detecting *truly unexpected programming errors* — invariants that cannot be violated in a correct program. For all anticipated failure modes (network timeouts, upstream errors, malformed input), use `Result` and the `?` operator so that errors propagate cleanly through Pingora's error-handling pipeline, get logged with full request context, and can be observed via metrics.
+
+```rust
+// Preferred: propagate errors through the pipeline
+async fn upstream_peer(
+    &self,
+    session: &mut Session,
+    _ctx: &mut Self::CTX,
+) -> Result<Box<HttpPeer>> {
+    let upstream = self.0.select(b"", 256)
+        .ok_or_else(|| Error::new(ErrorType::InternalError))?;
+    Ok(Box::new(HttpPeer::new(upstream, false, String::new())))
+}
+
+// Avoid: panics that bypass the error-logging pipeline
+async fn upstream_peer(
+    &self,
+    session: &mut Session,
+    _ctx: &mut Self::CTX,
+) -> Result<Box<HttpPeer>> {
+    // This will panic and close the client connection without a proper error response
+    let upstream = self.0.select(b"", 256).unwrap();
+    Ok(Box::new(HttpPeer::new(upstream, false, String::new())))
+}
+```
+
+<Tip>
+Returning `Err(...)` from a `ProxyHttp` callback gives Pingora the opportunity to call `fail_to_proxy`, send a proper error response (502, 500, etc.) to the client, invoke your `logging` callback, and emit a structured error log entry containing the output of `request_summary`. A panic bypasses all of this, making failures harder to diagnose.
+</Tip>

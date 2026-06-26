@@ -1,0 +1,195 @@
+---
+title: "Configuring Upstream Peers with HttpPeer"
+sidebarTitle: "Upstream Peer"
+description: "How to define upstream connections in Pingora using HttpPeer and PeerOptions — TLS, timeouts, mTLS, ALPN, TCP keepalive, and more."
+---
+
+The `upstream_peer()` phase is where you tell Pingora exactly how to reach the upstream server for each request. You return a `Box<HttpPeer>`, and Pingora uses that to establish (or reuse) the connection, negotiate TLS, and configure every aspect of the transport. Because `upstream_peer()` is called per-request with full access to the request headers and your `CTX` state, you have complete freedom to implement any routing strategy — consistent hashing, round-robin, path-based routing, failover, or anything else.
+
+## HttpPeer Attributes
+
+An `HttpPeer` bundles the target address with all the connection-level metadata Pingora needs.
+
+| Attribute | Type | Meaning |
+|-----------|------|---------|
+| `address` | `SocketAddr` | The IP address and port to connect to |
+| `scheme` | `Scheme` | `Http` or `Https` — controls whether TLS is used |
+| `sni` | `String` | The TLS Server Name Indication value (HTTPS only) |
+| `proxy` | `Option<Proxy>` | Tunnel the upstream connection through an HTTP CONNECT proxy |
+| `client_cert_key` | `Option<Arc<CertKey>>` | Client certificate and private key for mTLS connections |
+| `options` | `PeerOptions` | Detailed timeout, TLS, and transport configuration (see below) |
+
+## PeerOptions Reference
+
+`PeerOptions` provides fine-grained control over how a connection is established and maintained.
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `bind_to` | `Option<InetSocketAddr>` | Local address to bind to as the outgoing client IP |
+| `connection_timeout` | `Option<Duration>` | Maximum time to wait for the TCP handshake to complete |
+| `total_connection_timeout` | `Option<Duration>` | Maximum time to wait for the full connection, including TLS handshake |
+| `read_timeout` | `Option<Duration>` | Maximum time to wait for each individual `read()` from upstream; resets after every read |
+| `idle_timeout` | `Option<Duration>` | How long an idle pooled connection is kept alive; set to `0` to disable pooling |
+| `write_timeout` | `Option<Duration>` | Maximum time allowed for a `write()` to the upstream to complete |
+| `verify_cert` | `bool` | Whether to validate the upstream server's TLS certificate |
+| `verify_hostname` | `bool` | Whether to check that the server certificate's CN/SAN matches the SNI |
+| `use_system_certs` | `bool` | Load and use the system trust store for certificate validation (s2n-tls only; has a performance cost) |
+| `alternative_cn` | `Option<String>` | Accept the server certificate if its CN matches this alternative name |
+| `alpn` | `ALPN` | Which HTTP protocol(s) to advertise during ALPN negotiation (HTTP/1.1, HTTP/2, or both) |
+| `ca` | `Option<Arc<Box<[X509]>>>` | Custom root CA(s) to use instead of the system trust store |
+| `psk` | `Option<Arc<PskConfig>>` | PSK configuration for [PSK-TLS](https://datatracker.ietf.org/doc/html/rfc4279) handshakes (s2n-tls only) |
+| `s2n_security_policy` | `Option<S2NPolicy>` | [S2N security policy](https://aws.github.io/s2n-tls/usage-guide/ch06-security-policies.html) to use; defaults to `default_tls13` (s2n-tls only) |
+| `max_blinding_delay` | `Option<u32>` | Maximum [blinding delay](https://aws.github.io/s2n-tls/usage-guide/ch03-error-handling.html#blinding) in seconds applied on peer-triggered errors; default is 30 (s2n-tls only) |
+| `tcp_keepalive` | `Option<TcpKeepalive>` | TCP keepalive settings for the upstream connection |
+| `http_upstream_request_policy` | `HttpUpstreamRequestPolicy` | Controls automatic handling of hop-by-hop headers and HTTP/1 upgrade fields |
+
+## HTTP Upstream Request Header Policy
+
+By default, Pingora strips downstream hop-by-hop request fields and any fields nominated by the `Connection` header before sending the request upstream. For HTTP/1 upstreams, if the request body is non-empty and neither `Content-Length` nor `Transfer-Encoding` is present after `upstream_request_filter()` runs, Pingora automatically adds `Transfer-Encoding: chunked`. Valid WebSocket upgrade handshakes are forwarded in a normalized form; other HTTP/1 upgrades are not forwarded by default.
+
+When connection-nomination stripping is enabled, Pingora rejects requests where `Connection` nominates `Host`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`, or a pseudo-header-shaped field such as `:authority`. Requests with ten or more connection nominations are also rejected. These checks prevent silent removal of routing or request-origin metadata.
+
+**To preserve all hop-by-hop fields (RFC-non-compliant passthrough mode):**
+
+```rust
+use pingora_core::upstreams::peer::HttpUpstreamRequestPolicy;
+
+peer.options.http_upstream_request_policy = HttpUpstreamRequestPolicy::preserve();
+```
+
+<Warning>
+`HttpUpstreamRequestPolicy::preserve()` is RFC-non-compliant and must be used at your own risk. When this preset is active, your `upstream_request_filter()` implementation becomes solely responsible for correct hop-by-hop request handling.
+</Warning>
+
+**To retain fields nominated by `Connection` while keeping all other default behavior:**
+
+```rust
+peer.options
+    .http_upstream_request_policy
+    .strip_connection_nominated = false;
+```
+
+**To preserve complete HTTP/1 upgrade handshakes while keeping ordinary request normalization:**
+
+```rust
+use pingora_core::upstreams::peer::H1UpgradePolicy;
+
+peer.options.http_upstream_request_policy.h1_upgrade = H1UpgradePolicy::Preserve;
+```
+
+This mode preserves the complete request metadata for upgrade requests, because an arbitrary protocol handshake can depend on any connection-nominated field. It is also RFC-non-compliant; protected nomination validation still applies when `strip_connection_nominated` is enabled.
+
+## Examples
+
+### Basic HTTPS Peer
+
+The most common case: connect to an upstream over HTTPS using a known IP and hostname for SNI.
+
+```rust
+async fn upstream_peer(
+    &self,
+    _session: &mut Session,
+    _ctx: &mut Self::CTX,
+) -> Result<Box<HttpPeer>> {
+    // HttpPeer::new(address, tls: bool, sni: String)
+    let peer = Box::new(HttpPeer::new(
+        ("1.1.1.1", 443),
+        true,
+        "one.one.one.one".to_string(),
+    ));
+    Ok(peer)
+}
+```
+
+### Basic HTTP Peer (No TLS)
+
+Pass `false` as the second argument to `HttpPeer::new` to connect over plain HTTP.
+
+```rust
+async fn upstream_peer(
+    &self,
+    _session: &mut Session,
+    _ctx: &mut Self::CTX,
+) -> Result<Box<HttpPeer>> {
+    let peer = Box::new(HttpPeer::new(
+        ("192.168.1.10", 8080),
+        false,          // tls = false → plain HTTP
+        String::new(),  // SNI not used for plain HTTP
+    ));
+    Ok(peer)
+}
+```
+
+### Peer with Custom Timeout
+
+Set a tight connection timeout — useful when implementing fast failover.
+
+```rust
+async fn upstream_peer(
+    &self,
+    _session: &mut Session,
+    ctx: &mut Self::CTX,
+) -> Result<Box<HttpPeer>> {
+    let mut peer = Box::new(HttpPeer::new(
+        ("192.0.2.1", 443),
+        true,
+        "one.one.one.one".to_string(),
+    ));
+    peer.options.connection_timeout = Some(Duration::from_millis(100));
+    Ok(peer)
+}
+```
+
+### mTLS Peer
+
+Provide a client certificate and key for mutual TLS authentication to the upstream.
+
+```rust
+use std::sync::Arc;
+use pingora_core::tls::pkey::PKey;
+use pingora_core::tls::x509::X509;
+
+async fn upstream_peer(
+    &self,
+    _session: &mut Session,
+    _ctx: &mut Self::CTX,
+) -> Result<Box<HttpPeer>> {
+    let cert = X509::from_pem(CERT_PEM)?;
+    let key = PKey::private_key_from_pem(KEY_PEM)?;
+    let cert_key = Arc::new(CertKey::new(vec![cert], key));
+
+    let mut peer = Box::new(HttpPeer::new(
+        ("internal-api.example.com", 443),
+        true,
+        "internal-api.example.com".to_string(),
+    ));
+    peer.client_cert_key = Some(cert_key);
+    Ok(peer)
+}
+```
+
+### CONNECT Proxy Peer
+
+Tunnel the upstream connection through an intermediate HTTP CONNECT proxy.
+
+```rust
+use pingora_core::upstreams::peer::Proxy;
+
+async fn upstream_peer(
+    &self,
+    _session: &mut Session,
+    _ctx: &mut Self::CTX,
+) -> Result<Box<HttpPeer>> {
+    let mut peer = Box::new(HttpPeer::new(
+        ("target.example.com", 443),
+        true,
+        "target.example.com".to_string(),
+    ));
+    // Route through a CONNECT proxy at proxy.internal:3128
+    peer.proxy = Some(Proxy {
+        uri: "http://proxy.internal:3128".parse().unwrap(),
+        credentials: None,
+    });
+    Ok(peer)
+}
+```

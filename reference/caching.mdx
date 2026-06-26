@@ -1,0 +1,234 @@
+---
+title: "HTTP Caching with pingora-cache"
+sidebarTitle: "Caching"
+description: "Integrate HTTP caching into a Pingora proxy using pingora-cache — cache storage backends, cache keys, TTL, and cache control filters. Note: currently experimental."
+---
+
+`pingora-cache` provides a fully-featured HTTP caching layer that plugs into the Pingora proxy pipeline. It implements the standard HTTP caching semantics defined in RFC 9111: cache-key lookup, freshness evaluation, stale-while-revalidate, stale-if-error, conditional revalidation (ETags, Last-Modified), `Vary` header handling, and concurrent-request cache locking to prevent thundering herds. The layer is modelled as an explicit state machine (`HttpCache`) that transitions through well-defined phases over the lifetime of a request.
+
+<Warning>
+`pingora-cache` is **experimental**. All APIs related to caching are currently highly volatile and may change without notice between minor versions. Do not use in production systems that require API stability.
+</Warning>
+
+---
+
+## Enabling the Cache Feature
+
+```toml
+[dependencies]
+pingora = { version = "0.8.0", features = ["cache", "openssl"] }
+```
+
+This pulls in `pingora-cache` and makes it available under `pingora::cache`. You can also depend on `pingora-cache` directly without the umbrella crate.
+
+---
+
+## Core Types
+
+### `CacheKey`
+
+`CacheKey` identifies a cached asset in storage. It is composed of a namespace, a primary key (typically the URL), and an optional variance key (derived from the `Vary` header). Two requests with the same `CacheKey` share the same cached entry.
+
+```rust
+use pingora::cache::CacheKey;
+
+// namespace, primary key, extra disambiguator
+let key = CacheKey::new("", "https://example.com/api/data", "");
+```
+
+### `CacheMeta`
+
+`CacheMeta` holds the metadata about a cached asset: the response header, freshness timestamps (`created`, `fresh_until`), `stale-while-revalidate` and `stale-if-error` windows, and variance information. It is returned from a successful cache lookup alongside a `HitHandler`.
+
+```rust
+// Typically constructed via the cacheable_filter callback, not directly
+let meta: CacheMeta = ...;
+let fresh_until = meta.fresh_until();
+let created = meta.created();
+```
+
+### `CacheMetaDefaults`
+
+`CacheMetaDefaults` provides the default TTL policy when the origin does not supply explicit `Cache-Control` or `Expires` headers. You supply a function mapping HTTP status codes to `Option<Duration>` (returning `None` marks the status as not cacheable by default), plus the default `stale-while-revalidate` and `stale-if-error` windows in seconds.
+
+```rust
+use pingora::cache::{CacheMetaDefaults};
+use std::time::Duration;
+
+static CACHE_DEFAULTS: CacheMetaDefaults = CacheMetaDefaults::new(
+    /* fresh_sec_fn */
+    |status| match status {
+        200 | 206 => Some(Duration::from_secs(3600)),
+        301 => Some(Duration::from_secs(86400)),
+        _ => None,
+    },
+    /* stale_while_revalidate_sec */ 30,
+    /* stale_if_error_sec */ 300,
+);
+```
+
+### `HitHandler`
+
+`HitHandler` (`Box<dyn HandleHit + Sync + Send>`) is the interface returned from a cache hit. It lets you stream the cached body and finishes by releasing any read lock on the entry.
+
+### `MissHandler`
+
+`MissHandler` (`Box<dyn HandleMiss + Sync + Send>`) is the write-side counterpart. It is used to admit a newly fetched response body into the cache store.
+
+### `Storage` trait
+
+`Storage` is the plug-in interface for cache backends. Implement it to store cache entries anywhere — in-memory, on disk, in Redis, etc.
+
+```rust
+#[async_trait]
+pub trait Storage {
+    async fn lookup(
+        &'static self,
+        key: &CacheKey,
+        trace: &SpanHandle,
+    ) -> Result<Option<(CacheMeta, HitHandler)>>;
+
+    async fn get_miss_handler(
+        &'static self,
+        key: &CacheKey,
+        meta: &CacheMeta,
+        trace: &SpanHandle,
+    ) -> Result<MissHandler>;
+
+    async fn purge(
+        &'static self,
+        key: &CompactCacheKey,
+        purge_type: PurgeType,
+        trace: &SpanHandle,
+    ) -> Result<bool>;
+
+    async fn update_meta(
+        &'static self,
+        key: &CacheKey,
+        meta: &CacheMeta,
+        trace: &SpanHandle,
+    ) -> Result<bool>;
+
+    fn as_any(&self) -> &(dyn Any + Send + Sync + 'static);
+}
+```
+
+---
+
+## Cache Storage
+
+### `MemCache` (built-in)
+
+`MemCache` is the ready-to-use in-memory `Storage` implementation included in `pingora-cache`. It is backed by `pingora-lru` and supports streaming partial writes (so downstream clients can start reading a response while it is still being written to the cache from upstream).
+
+```rust
+use pingora::cache::MemCache;
+
+// MemCache is designed to be used as a 'static reference
+static MEM_CACHE: once_cell::sync::Lazy<MemCache> =
+    once_cell::sync::Lazy::new(MemCache::new);
+```
+
+Pass it to `HttpCache::enable` when handling a request:
+
+```rust
+session.cache.enable(
+    &*MEM_CACHE,
+    None,          // eviction manager (optional)
+    None,          // cache predictor (optional)
+    None,          // cache lock (optional)
+    None,          // option overrides (optional)
+);
+```
+
+### Custom storage
+
+Implement `Storage` for your preferred backend (e.g. a shared Redis cluster) and pass a `'static` reference to `HttpCache::enable`. The `as_any` method is required for runtime type checks (e.g. `HttpCache::storage_type_is::<MyStorage>()`).
+
+---
+
+## Cache Control
+
+The `cache_control` module provides RFC 9111-compliant parser for `Cache-Control` headers. It handles all standard directives (`max-age`, `s-maxage`, `no-cache`, `no-store`, `must-revalidate`, `stale-while-revalidate`, `stale-if-error`, and extension directives) and is used internally by `CacheMeta` freshness calculations.
+
+The `CacheMetaDefaults` type (described above) lets you set site-wide TTL and stale-serving policies that apply when the origin response does not include explicit cache directives.
+
+---
+
+## The `HttpCache` State Machine
+
+`HttpCache` is a phase-gated state machine. Calling methods in the wrong phase will panic, which helps catch integration bugs early during development. The phases are:
+
+| Phase | Meaning |
+|---|---|
+| `Disabled(NeverEnabled)` | Cache was never turned on for this request |
+| `Uninit` | Cache enabled but no key set yet |
+| `CacheKey` | Cache key assigned; awaiting lookup |
+| `Hit` | Fresh cached asset found |
+| `Miss` | No cached asset found; will fetch from upstream |
+| `Stale` | Expired asset found; may revalidate or serve stale |
+| `StaleUpdating` | Stale asset being served while another request revalidates |
+| `Expired` | Stale asset found; this request will refetch |
+| `Revalidated` | Conditional request succeeded; asset is fresh again |
+| `Bypass` | Caching explicitly skipped for this request |
+
+The typical flow for a cache miss is:
+
+```
+enable() → set_cache_key() → cache_lookup() [Miss] → cache_miss()
+    → set_cache_meta() → set_miss_handler() → [stream body] → finish_miss_handler()
+```
+
+And for a cache hit:
+
+```
+enable() → set_cache_key() → cache_lookup() [Hit] → cache_found()
+    → hit_handler().read_body() → finish_hit_handler()
+```
+
+---
+
+## Cache Phases in ProxyHttp
+
+Integration with `pingora-proxy` is done by implementing certain `ProxyHttp` callback methods that correspond to caching phases — for example `cache_key_callback`, `response_cache_filter`, `cache_hit_filter`, and `upstream_response_filter`. These methods let you customise the cache key, decide whether a response is cacheable, override freshness, and implement custom purge logic.
+
+<Note>
+The full documentation of cache-related `ProxyHttp` callbacks is still a work in progress in the official Pingora docs. Refer to the inline rustdoc comments in `pingora-proxy/src/proxy_cache.rs` and the example in `pingora/examples/` for the most current guidance.
+</Note>
+
+---
+
+## Maximum File Size
+
+You can limit which responses are admitted to the cache based on body size. Call `set_max_file_size_bytes` early in the request lifecycle, then call `track_body_bytes_for_max_file_size` as upstream body chunks arrive. If the limit is exceeded, `exceeded_max_file_size()` returns `true` and you should disable caching for that response.
+
+```rust
+session.cache.set_max_file_size_bytes(10 * 1024 * 1024); // 10 MiB
+```
+
+---
+
+## `pingora-memory-cache`: General-Purpose Async Cache
+
+`pingora-memory-cache` is a **separate crate** from `pingora-cache`. Where `pingora-cache` is an HTTP-specific caching layer with full RFC 9111 semantics, `pingora-memory-cache` is a lightweight, general-purpose async in-memory cache suitable for any key-value workload.
+
+<Note>
+**`pingora-cache`** is the HTTP caching layer — it understands `Cache-Control`, `Vary`, ETags, stale-while-revalidate, etc., and is designed to cache HTTP responses in a proxy pipeline.
+
+**`pingora-memory-cache`** is a general async key-value cache backed by TinyUfo. It has no HTTP semantics. Use it to cache arbitrary computed values, database query results, or configuration data inside your application logic.
+</Note>
+
+`pingora-memory-cache` exposes `RTCache`, a read-through cache that automatically calls a user-supplied `Lookup` implementation on a miss and serialises concurrent requests for the same key behind a cache lock (preventing cache stampede):
+
+```rust
+use pingora_memory_cache::RTCache;
+use std::time::Duration;
+
+// RTCache<KeyType, ValueType, ExtraType>
+let cache: RTCache<String, String, ()> = RTCache::new(
+    1000,              // maximum number of entries
+    Some(Duration::from_secs(5)), // max lock age before giving up
+);
+```
+
+It is backed by the `TinyUfo` caching algorithm — a modern approximate-LRU design that achieves high hit ratios with low memory overhead.

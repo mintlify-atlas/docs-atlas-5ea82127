@@ -1,0 +1,257 @@
+---
+title: "Pingora Internals: Runtime, Threading, and Architecture"
+sidebarTitle: "Internals"
+description: "Understand Pingora's async runtime model, work-stealing thread pool, connection handling architecture, and how services are organized internally."
+---
+
+Understanding Pingora's internals helps you reason about performance, tune thread counts, and integrate background services correctly. The framework is built around a clear ownership model: a single `Server` coordinates multiple independent `Service` instances, each of which owns its own Tokio runtime and threadpool. This design avoids cross-service thread contention and enables per-service tuning without any shared executor overhead.
+
+<Note>
+Some advanced topics — particularly the proxy phase chart and cache integration callbacks — are still a work-in-progress in the official Pingora documentation. The information on this page is sourced from the upstream `docs/user_guide/internals.md` and from reading the source code directly.
+
+<Tip>
+For the most up-to-date internal API details, consult the Rust API docs at [docs.rs/pingora-core](https://docs.rs/pingora-core) and [docs.rs/pingora](https://docs.rs/pingora).
+</Tip>
+</Note>
+
+---
+
+## Starting the Server
+
+A Pingora application starts by creating and running a `Server`. The `Server` is responsible for spawning all registered `Service` instances and listening for termination signals (SIGTERM, SIGQUIT on Unix).
+
+```
+                           ┌───────────┐
+                ┌─────────>│  Service  │
+                │          └───────────┘
+┌────────────┐  │          ┌───────────┐
+│   Server   │──┼─────────>│  Service  │
+└────────────┘  │          └───────────┘
+                │          ┌───────────┐
+                └─────────>│  Service  │
+                           └───────────┘
+```
+
+After spawning services, the `Server` blocks waiting for a shutdown signal and propagates it to all running services when one arrives. This enables graceful draining without dropped connections.
+
+```rust
+use pingora::prelude::{Server, Opt};
+
+let mut server = Server::new(None).unwrap(); // None = no CLI arg parsing
+server.bootstrap();
+server.add_service(my_proxy_service);
+server.run_forever(); // blocks until shutdown signal
+```
+
+---
+
+## The Service Model
+
+Each `Service` instance encapsulates:
+
+- A set of **listening endpoints** (`Listeners`) — TCP sockets, Unix domain sockets, etc., each optionally with TLS.
+- An **application** (`A: ServiceApp`) — the logic that handles each accepted connection.
+- Its own **Tokio runtime** with a dedicated threadpool.
+
+Services do not share threads or executors. Worker threads are strictly partitioned per service, which means a CPU-intensive proxy service cannot starve a lightweight metrics service.
+
+```
+┌──────────────────────────────────────┐
+│ ┌──────────────────────────────────┐ │
+│ │ ┌────────────┬────────────┐      │ │
+│ │ │  Conn      │  Conn      │      │ │
+│ │ ├────────────┼────────────┤      │ │
+│ │ │  Endpoint  │  Endpoint  │      │ │
+│ │ ├────────────┴────────────┤      │ │
+│ │ │        Listeners        │      │ │
+│ │ ├──────────┬──────────────┤      │ │
+│ │ │  Worker  │  Worker      │      │ │
+│ │ │  Thread  │  Thread      │      │ │
+│ │ ├──────────┴──────────────┤      │ │
+│ │ │     Tokio Executor      │      │ │
+│ │ └─────────────────────────┘      │ │
+│ └──────────────────────────────────┘ │
+│ ┌─────────┐                          │
+└─┤ Service ├──────────────────────────┘
+  └─────────┘
+```
+
+---
+
+## Threading Model
+
+### The `threads` configuration option
+
+Each service has an independent thread count. The global default is set in `ServerConf`:
+
+```yaml
+# pingora configuration YAML
+threads: 4       # threads per service
+work_stealing: true
+```
+
+Or programmatically:
+
+```rust
+let mut service = http_proxy_service(&server.configuration, my_proxy);
+service.threads = Some(8); // override the global default for this service
+```
+
+A service with `threads: N` gets a Tokio runtime with `N` worker threads. If `N` is 1 the runtime is effectively a single-threaded executor.
+
+### Work-stealing vs. isolated runtimes
+
+The `work_stealing` configuration option (default: `true`) controls how the multi-threaded executor is structured:
+
+- **`work_stealing: true`** — A single multi-threaded Tokio runtime with N worker threads and work-stealing. Tasks are automatically rebalanced across idle threads. This is the standard Tokio `rt-multi-thread` runtime and is the most efficient choice for most workloads.
+
+- **`work_stealing: false`** — N independent single-threaded Tokio runtimes, one per thread. Tasks are pinned to their originating thread and never migrate. This eliminates work-stealing overhead and improves CPU cache locality, at the cost of potential load imbalance if some threads become hot while others idle.
+
+---
+
+## Service Listeners and `TransportStack`
+
+At startup, each service's endpoints are built into `TransportStack` objects. Each `TransportStack` bundles a listening socket, an optional TLS acceptor, and upgrade file descriptors (for zero-downtime upgrades). One async task is spawned per `TransportStack` within the service's executor:
+
+```
+Endpoint (addr + TLS settings)
+        │
+        ▼
+  TransportStack
+  (Listener, TLS Acceptor, UpgradeFDs)
+        │
+        └──spawn(run_endpoint())──► Service<ServerApp> task
+```
+
+A single service can listen on multiple endpoints simultaneously. Each endpoint runs its own independent accept loop.
+
+---
+
+## Downstream Connection Lifecycle
+
+Each accepted TCP connection is processed in its own Tokio task. The lifecycle follows these steps:
+
+1. `UninitStream::handshake()` — TLS handshake (if applicable) and protocol detection.
+2. `Service::handle_event()` — Route the connection to the appropriate application handler.
+3. `App::process_new()` — Handle the first request/event on the connection.
+4. The task loops at step 3 while the connection is being reused (HTTP keep-alive, HTTP/2 multiplexing).
+5. When the connection is closed, the task ends.
+
+```
+                          ┌───────────────┐  ┌────────────────┐  ┌─────────────────┐
+┌────────────────────┐    │ UninitStream  │  │    Service     │  │       App       │
+│                    │    │ ::handshake() │─>│::handle_event()│─>│::process_new()  │──┐
+│ Service<ServerApp> │───>└───────────────┘  └────────────────┘  └─────────────────┘  │
+│                    │                                                    ▲         │
+└────────────────────┘                                                    └─────────┘
+                                                                          (while reuse)
+```
+
+Connections are task-per-connection, so a slow or long-lived connection never blocks unrelated requests running on other tasks within the same thread pool.
+
+---
+
+## What is a Proxy?
+
+The `Server` has no built-in notion of a proxy. It operates purely in terms of `Service<A>` where `A` implements `ServiceApp`. The `pingora-proxy` crate layers HTTP proxy semantics on top by providing `HttpProxy<CTX>` which implements `HttpServerApp`, which in turn implements `ServerApp`:
+
+```
+HttpProxy (struct)
+    │ implements
+    ▼
+HttpServerApp (trait) ── handles H1 vs H2 stream selection, H2 handshake
+    │ implements
+    ▼
+ServerApp (trait) ── dispatches App instances as individual tasks per Session
+    │ contained within
+    ▼
+Service<A> (struct) ── dispatches App instances as tasks per Listener
+```
+
+The `HttpProxy` struct drives the high-level proxy workflow and exposes customisation points via the `ProxyHttp` trait. Implementing `ProxyHttp` lets you hook into each phase of request processing: `request_filter`, `upstream_peer`, `upstream_request_filter`, `upstream_response_filter`, `response_filter`, `logging`, and more.
+
+---
+
+## Managing Upstream Connections: Connectors
+
+Connections to upstream peers are managed by **Connectors**. A `Connector` is not a single type but a pattern: it handles establishing a connection to a `Peer`, maintaining a connection pool for reuse across requests, measuring connection health (H2 pings), and handling protocol-specific concerns like H2 multiplexing and compression.
+
+Peer selection — choosing *which* upstream to connect to — is handled one level above, in the `upstream_peer()` method of the `ProxyHttp` trait. The `LoadBalancer` from `pingora-load-balancing` is typically used there.
+
+```
+┌────────────┐        ┌───────────────┐       ┌────────────┐
+│ Downstream │        │     Proxy     │       │  Upstream  │
+│   Client   │───────>│ (Listeners)   │──────>│   Server   │
+└────────────┘        │ (Connectors)  │       └────────────┘
+                      └───────────────┘
+```
+
+---
+
+## Background Services
+
+`BackgroundService` is an interface for long-running tasks that exist outside the request/response lifecycle — service discovery, health checks, metrics export, etc. A background service is wrapped with `background_service()` and added to the `Server` just like any other service:
+
+```rust
+use pingora::services::background::background_service;
+use std::sync::Arc;
+
+// LoadBalancer implements BackgroundService out of the box
+let lb = Arc::new(my_load_balancer);
+let bg = background_service("lb-health-checker", lb.clone());
+server.add_service(bg);
+```
+
+The `BackgroundService` trait provides two entry points:
+
+```rust
+#[async_trait]
+pub trait BackgroundService {
+    /// Called at startup. Should signal readiness by calling
+    /// `ready_notifier.notify_ready()` once initialization is complete.
+    async fn start_with_ready_notifier(
+        &self,
+        shutdown: ShutdownWatch,
+        ready_notifier: ServiceReadyNotifier,
+    ) { /* default: immediately ready, then calls start() */ }
+
+    /// Simpler entry point without readiness notification.
+    async fn start(&self, shutdown: ShutdownWatch) {}
+}
+```
+
+The `start_with_ready_notifier` variant is useful when downstream services must wait for the background task to finish its first discovery or health-check cycle before they start accepting traffic.
+
+---
+
+## Per-Service Runtime Customisation
+
+For advanced use cases, the Tokio runtime options for an individual service can be overridden without changing the global server configuration. Set a `RuntimeOptsOverride` callback on the service:
+
+```rust
+use std::sync::Arc;
+use pingora::services::listening::Service;
+
+let override_fn: RuntimeOptsOverride = Arc::new(|global_opts| {
+    let mut opts = global_opts.clone();
+    opts.worker_threads = Some(2); // this service gets only 2 threads
+    Some(opts)
+});
+
+my_service.set_runtime_opts_override(override_fn);
+```
+
+Returning `None` from the callback means "use the global settings unchanged." Returning `Some(opts)` replaces the runtime configuration for that service only.
+
+---
+
+## Zero-Downtime Upgrades
+
+Pingora supports graceful upgrades on Unix systems using file-descriptor passing. When a new process is started alongside a running one, the old process passes its listening socket FDs to the new process. The new process begins accepting new connections while the old process continues to drain existing ones. The `UpgradeFDs` mechanism in `TransportStack` handles this transfer transparently.
+
+Configuration for grace period behaviour is exposed through `ServerConf`:
+
+```yaml
+grace_period_seconds: 1     # time to wait for in-flight requests to finish
+graceful_shutdown_timeout_seconds: 10  # hard timeout for shutdown
+```

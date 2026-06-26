@@ -1,0 +1,95 @@
+---
+title: "Running Pingora as a Daemon"
+sidebarTitle: "Daemonization"
+description: "How to run a Pingora server as a background daemon, drop privileges after bootstrap, and use pid_file to track the process."
+---
+
+Daemonization moves a Pingora server to the background after it has finished bootstrapping. The process detaches from the controlling terminal, redirects its output to a configured log file, and optionally changes its working directory and running identity. This is the standard way to deploy Pingora in production environments where a process manager or init system is in charge.
+
+## Enabling Daemonization
+
+Daemonization can be activated in two equivalent ways:
+
+**Via CLI flag** — pass `-d` or `--daemon` when starting the binary:
+
+```bash
+RUST_LOG=INFO ./my_pingora_server -d -c /etc/pingora.conf
+```
+
+**Via config file** — set `daemon: true` in the YAML configuration:
+
+```yaml
+---
+version: 1
+daemon: true
+pid_file: /run/pingora.pid
+error_log: /var/log/pingora/error.log
+user: nobody
+group: webusers
+```
+
+Both approaches are equivalent. The CLI flag takes precedence when both are specified.
+
+## How Fork Works in `run_forever()`
+
+Daemonization is implemented inside the `run_forever()` call using a `fork()` syscall. The parent process exits immediately after the fork; the child becomes the background daemon.
+
+<Warning>
+Any threads you create **before** calling `run_forever()` exist only in the parent process and are lost after the fork. Service logic, thread pools, and async runtimes must be created after `run_forever()` begins — i.e., inside service implementations, not in `main()` before the call.
+</Warning>
+
+## Privilege Dropping
+
+Daemonization is the standard place to perform privilege separation. You can start the process as `root` to perform privileged actions — loading TLS private keys, binding to port 443, reading secrets from protected files — and then have Pingora switch to an unprivileged `user` and `group` before it begins accepting network connections.
+
+Configure the target identity in the YAML file:
+
+```yaml
+---
+version: 1
+daemon: true
+user: nobody
+group: webusers
+```
+
+The privilege drop happens automatically during the daemonization step in `run_forever()`. After the switch, the process cannot regain elevated privileges.
+
+## Tracking the Process with `pid_file`
+
+When running in the background, you need a reliable way to find the daemon's PID in order to send it signals (SIGTERM, SIGQUIT, etc.). Set `pid_file` in the config and Pingora will write the daemon's PID to that path after daemonization:
+
+```yaml
+---
+version: 1
+daemon: true
+pid_file: /run/pingora.pid
+```
+
+You can then signal the daemon directly:
+
+```bash
+kill -SIGTERM $(cat /run/pingora.pid)
+```
+
+## Readiness Signalling with `daemon_wait_for_ready`
+
+By default, the parent process exits as soon as the fork succeeds, before the child has finished bootstrapping. For systemd-based deployments this is a problem: if the parent exits too early, systemd may send SIGQUIT to the old service before the new instance is ready to accept traffic.
+
+Setting `daemon_wait_for_ready: true` makes the parent **block** until the daemon sends a `SIGUSR1` signal back to it, indicating that bootstrap is complete:
+
+```yaml
+---
+version: 1
+daemon: true
+daemon_wait_for_ready: true
+daemon_ready_timeout_seconds: 120
+daemon_notify_timeout_seconds: 60
+```
+
+| Setting | Effect | Default |
+|---|---|---|
+| `daemon_wait_for_ready` | Parent waits for `SIGUSR1` from daemon before exiting. | `false` |
+| `daemon_ready_timeout_seconds` | Seconds the parent will wait for readiness. Exits with non-zero code on timeout (causes systemd to abort reload). | `600` |
+| `daemon_notify_timeout_seconds` | Seconds the daemon retries sending `SIGUSR1` when the attempt fails with a permission error (covers the brief post-fork window where UIDs haven't settled). | `60` |
+
+See [systemd Integration](/guides/systemd) for how this interacts with `systemctl reload`.

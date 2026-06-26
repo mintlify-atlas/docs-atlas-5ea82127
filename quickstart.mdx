@@ -1,47 +1,320 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with Pingora: Build a Load Balancer"
+sidebarTitle: "Quickstart"
+description: "Build a round-robin load balancer with health checks and graceful upgrade support using Pingora and pingora-proxy in under 10 minutes."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+In this guide you will build a working HTTP load balancer that distributes incoming requests across two upstream backends — `1.1.1.1:443` and `1.0.0.1:443` — in a round-robin fashion. Along the way you will add TCP health checks so that a broken backend is automatically removed from rotation, wire up CLI argument parsing, write a configuration file, and perform a zero-downtime binary upgrade. By the end you will have a solid foundation you can adapt for your own upstream services.
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+
+  <Step title="Create a new Cargo project">
 
     ```bash
-    npm install your-package
+    cargo new load_balancer
+    cd load_balancer
     ```
-  </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
 
-    ```bash
-    your-cli init
-    ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+    Open `Cargo.toml` and add the two required dependencies. The `lb` feature flag pulls in `pingora-load-balancing` and `pingora-proxy`; `openssl` activates the OpenSSL TLS backend.
 
-    ```bash
-    your-cli start
+    ```toml
+    [dependencies]
+    async-trait = "0.1"
+    pingora = { version = "0.8.0", features = ["openssl", "lb"] }
     ```
+
   </Step>
+
+  <Step title="Create a Pingora Server">
+
+    A Pingora `Server` is a process that can host one or many services. It handles configuration and CLI argument parsing, daemonisation, OS signal handling, and graceful restart or shutdown. The idiomatic pattern is to construct it in `main()` and call `run_forever()` at the end, which spawns the Tokio runtime threads and blocks until the server is ready to exit.
+
+    Replace the contents of `src/main.rs` with:
+
+    ```rust
+    use async_trait::async_trait;
+    use pingora::prelude::*;
+    use std::sync::Arc;
+
+    fn main() {
+        let mut my_server = Server::new(None).unwrap();
+        my_server.bootstrap();
+        my_server.run_forever();
+    }
+    ```
+
+    This compiles and runs cleanly, but does nothing useful yet — there are no services attached.
+
+  </Step>
+
+  <Step title="Implement ProxyHttp for your load balancer">
+
+    Define the `LB` struct that wraps a `LoadBalancer<RoundRobin>` and implement the `ProxyHttp` trait for it. The only required method is `upstream_peer()`, which returns the address to proxy each request to. The `LoadBalancer::select()` call advances the round-robin cursor and returns the next healthy backend.
+
+    ```rust
+    pub struct LB(Arc<LoadBalancer<RoundRobin>>);
+
+    #[async_trait]
+    impl ProxyHttp for LB {
+        /// For this small example, we don't need context storage.
+        type CTX = ();
+        fn new_ctx(&self) -> () {
+            ()
+        }
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut (),
+        ) -> Result<Box<HttpPeer>> {
+            let upstream = self
+                .0
+                .select(b"", 256) // hash doesn't matter for round robin
+                .unwrap();
+
+            println!("upstream peer is: {upstream:?}");
+
+            // HttpPeer::new(address, tls, sni)
+            // `true`  — enable TLS, required for the 1.1.1.1 HTTPS backends.
+            // The SNI `one.one.one.one` must match the upstream certificate.
+            let peer = Box::new(HttpPeer::new(upstream, true, "one.one.one.one".to_string()));
+            Ok(peer)
+        }
+    }
+    ```
+
+  </Step>
+
+  <Step title="Add the upstream_request_filter hook">
+
+    The 1.1.1.1 demo backends require a `Host` header to be present. The `upstream_request_filter()` callback fires after the upstream connection is established but before the request headers are sent — the right place to inject or rewrite headers.
+
+    Add this method inside the same `impl ProxyHttp for LB` block:
+
+    ```rust
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        upstream_request
+            .insert_header("Host", "one.one.one.one")
+            .unwrap();
+        Ok(())
+    }
+    ```
+
+  </Step>
+
+  <Step title="Create the proxy service and wire it to the server">
+
+    `http_proxy_service()` wraps your `LB` in a `Service` that speaks HTTP proxy protocol. `add_tcp()` tells it which address and port to listen on. Finally, `add_service()` registers the service with the `Server` so it is started when `run_forever()` is called.
+
+    Replace your `main()` function with the complete version:
+
+    ```rust
+    fn main() {
+        let mut my_server = Server::new(None).unwrap();
+        my_server.bootstrap();
+
+        let upstreams =
+            LoadBalancer::try_from_iter(["1.1.1.1:443", "1.0.0.1:443"]).unwrap();
+
+        let mut lb = http_proxy_service(&my_server.configuration, LB(Arc::new(upstreams)));
+        lb.add_tcp("0.0.0.0:6188");
+
+        my_server.add_service(lb);
+        my_server.run_forever();
+    }
+    ```
+
+  </Step>
+
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## Test It
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+Start the load balancer:
+
+```bash
+cargo run
+```
+
+In a second terminal, send a few requests and watch the server logs alternate between the two backends:
+
+```bash
+curl 127.0.0.1:6188 -svo /dev/null
+```
+
+You should see output similar to the following in the server terminal, confirming that traffic is being distributed across both upstreams:
+
+```
+upstream peer is: Backend { addr: Inet(1.0.0.1:443), weight: 1 }
+upstream peer is: Backend { addr: Inet(1.1.1.1:443), weight: 1 }
+upstream peer is: Backend { addr: Inet(1.0.0.1:443), weight: 1 }
+upstream peer is: Backend { addr: Inet(1.1.1.1:443), weight: 1 }
+```
+
+You can also open [http://localhost:6188](http://localhost:6188) in your browser to verify.
+
+## Adapting to Your Own Upstreams
+
+The example above is deliberately tuned for the 1.1.1.1 demo backends. Pointing the load balancer at your own services usually requires two changes.
+
+<Tip>
+  When proxying to local plain-HTTP servers (e.g. `127.0.0.1:9000`), you must disable TLS in the `HttpPeer` constructor. Leaving `tls = true` against a non-TLS upstream will cause every connection attempt to fail with a `502 Bad Gateway`.
 </Tip>
+
+**1. Change the backend addresses** in `main()`:
+
+```rust
+let upstreams =
+    LoadBalancer::try_from_iter(["127.0.0.1:9000", "127.0.0.1:9001"]).unwrap();
+```
+
+**2. Disable TLS** in `upstream_peer()`. Pass `false` for the `tls` argument and an empty string for the SNI — it is ignored for plain-HTTP connections:
+
+```rust
+let peer = Box::new(HttpPeer::new(upstream, false, String::new()));
+```
+
+<Warning>
+  Never pass `tls = true` when your upstream speaks plain HTTP. The TLS handshake will fail and every request will return a `502`. Conversely, if your upstream requires TLS (e.g. an external HTTPS API), keep `tls = true` and provide the correct SNI hostname.
+</Warning>
+
+**3. Update or remove the `Host` header override** in `upstream_request_filter()`. The `one.one.one.one` value is specific to the demo backends; set it to whatever hostname your upstream expects, or delete the method entirely to let Pingora forward the original `Host` header from the client.
+
+## Add Health Checks
+
+Without health checks, a dead backend is still selected by the round-robin scheduler — every third request (in a three-peer pool) will fail with a `502`. Pingora's `TcpHealthCheck` probes each backend in the background and removes unhealthy peers from rotation automatically.
+
+First, add a third backend that is guaranteed to be broken so you can observe the effect:
+
+```rust
+let mut upstreams =
+    LoadBalancer::try_from_iter(["1.1.1.1:443", "1.0.0.1:443", "127.0.0.1:343"]).unwrap();
+```
+
+Then attach the health-check service:
+
+```rust
+use pingora::prelude::*;
+use pingora_core::services::background::background_service;
+use std::time::Duration;
+
+fn main() {
+    let mut my_server = Server::new(None).unwrap();
+    my_server.bootstrap();
+
+    let mut upstreams =
+        LoadBalancer::try_from_iter(["1.1.1.1:443", "1.0.0.1:443", "127.0.0.1:343"]).unwrap();
+
+    // Attach a TCP health check that probes each backend every second.
+    let hc = TcpHealthCheck::new();
+    upstreams.set_health_check(hc);
+    upstreams.health_check_frequency = Some(Duration::from_secs(1));
+
+    // Wrap the load balancer in a background service so the health checks run
+    // on their own Tokio task. `background.task()` gives back the Arc handle
+    // used by the proxy service.
+    let background = background_service("health check", upstreams);
+    let upstreams = background.task();
+
+    let mut lb = http_proxy_service(&my_server.configuration, LB(upstreams));
+    lb.add_tcp("0.0.0.0:6188");
+
+    // Register both the proxy service and the health-check background service.
+    my_server.add_service(lb);
+    my_server.add_service(background);
+
+    my_server.run_forever();
+}
+```
+
+With this in place, `127.0.0.1:343` will be marked unhealthy within one second of startup and will never receive traffic. If it later becomes reachable it will be re-added to rotation automatically within the next health-check cycle.
+
+## CLI Options and Daemon Mode
+
+Passing `Some(Opt::parse_args())` to `Server::new()` enables Pingora's built-in CLI argument parsing:
+
+```rust
+fn main() {
+    let opt = Opt::parse_args();
+    let mut my_server = Server::new(Some(opt)).unwrap();
+    // ...
+}
+```
+
+Run with `-h` to see all available flags:
+
+```bash
+cargo run -- -h
+```
+
+To run the process in the background, pass the `-d` / `--daemon` flag:
+
+```bash
+cargo run -- -d
+```
+
+Send `SIGTERM` for a graceful shutdown (the server stops accepting new connections but finishes all in-flight requests before exiting):
+
+```bash
+pkill -SIGTERM load_balancer
+```
+
+Send `SIGQUIT` to initiate a graceful upgrade (the server hands its listening sockets to a new process — see [Graceful Upgrade](#graceful-upgrade) below):
+
+```bash
+pkill -SIGQUIT load_balancer
+```
+
+## Configuration File
+
+Pingora can read runtime settings from a YAML configuration file. Create `conf.yaml` in your project directory:
+
+```yaml
+---
+version: 1
+threads: 2
+pid_file: /tmp/load_balancer.pid
+error_log: /tmp/load_balancer_err.log
+upgrade_sock: /tmp/load_balancer.sock
+```
+
+| Key | Description |
+|-----|-------------|
+| `version` | Config schema version — always `1` for now. |
+| `threads` | Number of Tokio worker threads. |
+| `pid_file` | Path where the daemon writes its PID. |
+| `error_log` | Path for the error log file. |
+| `upgrade_sock` | Unix socket used to hand over listening sockets during a graceful upgrade. |
+
+Start the daemon with the config file and enable INFO-level logging so that log entries are written to `error_log`:
+
+```bash
+RUST_LOG=INFO cargo run -- -c conf.yaml -d
+```
+
+Check the PID of the running daemon:
+
+```bash
+cat /tmp/load_balancer.pid
+```
+
+## Graceful Upgrade
+
+Pingora supports zero-downtime binary upgrades on Linux. The old process listens for `SIGQUIT`, then hands its open listening sockets to the new process over the `upgrade_sock` Unix socket. The old process continues handling its in-flight requests until they are all complete before exiting. From a client's perspective the listening socket is never closed.
+
+To upgrade a running daemon to a newly compiled binary:
+
+```bash
+# 1. Signal the running server to enter upgrade-wait mode.
+pkill -SIGQUIT load_balancer
+
+# 2. Start the new binary in upgrade mode (reads sockets from the old process).
+RUST_LOG=INFO cargo run -- -c conf.yaml -d --upgrade
+```
+
+The `-u` / `--upgrade` flag tells the new server to connect to `upgrade_sock` and receive the listening sockets from the old server rather than binding them fresh.

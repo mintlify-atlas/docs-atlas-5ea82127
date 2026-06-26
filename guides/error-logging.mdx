@@ -1,0 +1,131 @@
+---
+title: "Error Logging and Log Configuration in Pingora"
+sidebarTitle: "Error Logging"
+description: "Configure Pingora error logs — log levels, output file vs stderr, RUST_LOG environment variable, and custom request summaries for error context."
+---
+
+Pingora is built to handle adverse network conditions gracefully: disconnects, timeouts, and malformed input are all expected events rather than exceptional ones. Rather than crashing, Pingora records these issues through its structured error logging layer. Understanding how to configure log output, tune log levels, and enrich error entries with per-request context is essential for operating a Pingora service in production.
+
+## Log Output: File vs. STDERR
+
+By default, Pingora writes log output to standard error (STDERR). When running in daemon mode (with `daemon: true` in your configuration), you can redirect log output to a file by setting the `error_log` field in `ServerConf`:
+
+```yaml
+# conf.yaml
+version: 1
+daemon: true
+error_log: /var/log/my-proxy/error.log
+pid_file: /run/my-proxy.pid
+upgrade_sock: /tmp/my-proxy-upgrade.sock
+```
+
+The `error_log` path must be writable by the process. Pingora opens it with `O_APPEND | O_CREAT`, so existing log content is preserved across restarts.
+
+<Note>
+When `error_log` is not set in the configuration — or when running in the foreground (non-daemon mode) — all log output goes to STDERR. This is the expected behaviour in containerised environments where the container runtime collects STDERR automatically.
+</Note>
+
+## Log Levels
+
+Pingora adopts the conventions of the [`log`](https://docs.rs/log/latest/log/) crate. There are five levels, each with a distinct intended use:
+
+| Level   | Meaning |
+|---------|---------|
+| `error` | The error prevents the current request from being handled correctly. For example: the upstream server is offline. |
+| `warn`  | An error occurred but the system recovered. For example: the primary DNS query timed out but the secondary DNS responded successfully. |
+| `info`  | Informational messages about the server lifecycle — startup, shutdown, and health events. |
+| `debug` | Internal implementation details useful during development. **Not compiled into release builds.** |
+| `trace` | Fine-grained internal details. **Not compiled into release builds.** |
+
+## Controlling the Active Level with RUST_LOG
+
+Pingora respects the standard `RUST_LOG` environment variable. Set it before launching your binary to filter which log levels are emitted:
+
+```bash
+# Show info and above (recommended for development)
+RUST_LOG=INFO cargo run
+
+# Show warnings and errors only (suitable for production)
+RUST_LOG=WARN cargo run
+
+# Enable debug output for a single crate
+RUST_LOG=pingora_proxy=debug cargo run
+```
+
+Log levels are initialised at startup using `env_logger` (or a compatible backend). The most common pattern in Pingora examples is:
+
+```rust
+fn main() {
+    env_logger::init();
+
+    let mut my_server = Server::new(None).unwrap();
+    my_server.bootstrap();
+    // ...
+}
+```
+
+<Tip>
+Run with `RUST_LOG=INFO cargo run` during development to see request lifecycle events without the noise of debug-level output. Switch to `RUST_LOG=DEBUG` when diagnosing a specific issue; remember that `debug` and `trace` levels are stripped from release builds entirely.
+</Tip>
+
+## Custom Request Summaries
+
+The `pingora-proxy` crate provides a well-defined interface for error logging so that you do not need to manually log common proxy errors — Pingora handles that automatically. Every time an error log entry is generated for a request, Pingora calls the `request_summary` callback to produce a summary string that is appended to the log line.
+
+The default implementation delegates to the session's built-in summary (method, path, Host header, and similar fields). You can override it on your `ProxyHttp` implementation to include any additional context that is valuable for debugging:
+
+```rust
+use pingora::prelude::*;
+
+pub struct MyProxy {
+    // ...
+}
+
+impl ProxyHttp for MyProxy {
+    type CTX = MyCtx;
+
+    fn new_ctx(&self) -> Self::CTX {
+        MyCtx::default()
+    }
+
+    /// Enrich error log entries with per-request context stored in CTX.
+    fn request_summary(&self, session: &Session, ctx: &Self::CTX) -> String {
+        format!(
+            "{} appid={} trace_id={}",
+            session.as_ref().request_summary(), // include the default fields
+            ctx.appid.as_deref().unwrap_or("-"),
+            ctx.trace_id.as_deref().unwrap_or("-"),
+        )
+    }
+
+    // ... other required methods
+}
+```
+
+The returned string is embedded verbatim in the log line produced by Pingora's internal error handler:
+
+```
+ERROR Fail to proxy: ..., status: 502, tries: 1, retry: false, GET /api/v1 appid=my-app trace_id=abc123
+```
+
+## Suppressing Noisy Errors
+
+Some errors are expected in normal operation — for example, clients that disconnect mid-request — and logging them at `error` level produces noise that obscures real problems. Override `suppress_error_log` to return `true` for errors you want to silence:
+
+```rust
+fn suppress_error_log(
+    &self,
+    _session: &Session,
+    _ctx: &Self::CTX,
+    error: &Error,
+) -> bool {
+    // Suppress client-side read/write errors — these are usually abrupt disconnects
+    matches!(error.etype(), ReadError | WriteError | ConnectionClosed)
+}
+```
+
+A companion hook, `suppress_proxy_warn_log`, applies to retryable upstream failures and downstream errors that occur while a cache fill is in progress. Its signature is similar and it receives an additional `ProxyWarnLogContext` argument that identifies the specific warning scenario.
+
+<Note>
+Suppressing errors removes the only per-request audit record for that failure path. If you suppress a class of errors, consider emitting a Prometheus counter or a structured log entry in the same override so that the failures remain observable in aggregate.
+</Note>

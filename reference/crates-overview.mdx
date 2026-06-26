@@ -1,0 +1,121 @@
+---
+title: "Pingora Workspace Crates: A Complete Overview"
+sidebarTitle: "Crates Overview"
+description: "All crates in the Pingora workspace — their purpose, which features enable them, and Cargo.toml dependency examples for each."
+---
+
+Pingora is organised as a Cargo workspace where every piece of functionality lives in its own focused crate. The top-level `pingora` crate acts as an umbrella: it re-exports the most commonly needed items and uses Cargo features to pull in optional sub-crates such as `pingora-proxy`, `pingora-load-balancing`, and `pingora-cache`. This means you pay only for what you enable, and downstream crates that depend directly on a sub-crate (e.g. `pingora-core`) can do so without dragging in the full stack.
+
+The workspace uses Cargo resolver v2 and keeps shared dependency versions in `[workspace.dependencies]`, so every crate agrees on the same versions of `tokio`, `http`, `bytes`, and friends.
+
+---
+
+## Crate Reference Table
+
+| Crate | Purpose | Feature flag | Notes |
+|---|---|---|---|
+| `pingora` | Umbrella crate — re-exports everything under feature-gated modules (`proxy`, `lb`, `cache`, `time`) | — | The recommended entry point for new projects |
+| `pingora-core` | Protocols (HTTP/1, HTTP/2), server lifecycle, connectors, listeners, upstreams | Pulled in by `pingora` | Home of `Server`, `HttpPeer`, `BackgroundService` |
+| `pingora-proxy` | `ProxyHttp` trait, `http_proxy_service()`, session handling | `proxy` | Build reverse proxies by implementing `ProxyHttp` |
+| `pingora-cache` | HTTP caching state machine, `HttpCache`, `Storage` trait, `MemCache` | `cache` | **Experimental** — APIs are highly volatile |
+| `pingora-http` | HTTP header types that preserve original header case | Always available | Wraps the `http` crate with case-preserving extensions |
+| `pingora-error` | Common `Result` / `Error` types used across all Pingora crates | Always available | Provides `OrErr`, `ErrorType`, and `Error::e_explain` |
+| `pingora-load-balancing` | Backend selection algorithms, health checks, service discovery | `lb` | Implements `BackgroundService` for automatic updates |
+| `pingora-limits` | Efficient counting and rate-limiting (`Rate` struct) | — | Useful for per-IP or per-key rate limits |
+| `pingora-prometheus` | Prometheus metrics endpoint integration | — | Add to `Server` as a listening service |
+| `pingora-memory-cache` | Async in-memory cache (`RTCache`) with cache-lock to prevent stampede | — | Backed by TinyUfo; general-purpose, not HTTP-specific |
+| `pingora-pool` | Generic connection pool used internally by connectors | — | Used by `pingora-core` connectors |
+| `pingora-timeout` | Efficient async timer system with shared time wheel | `time` | More efficient than `tokio::time::timeout` at scale |
+| `pingora-ketama` | Ketama consistent-hashing algorithm | — | Used by `selection::Consistent` in `pingora-load-balancing` |
+| `pingora-lru` | LRU cache data structure used by storage backends | — | Internal use; re-exported where needed |
+| `pingora-openssl` | OpenSSL API compatibility layer (`ssl`, `x509`, `pkey`) | `openssl` | Requires native OpenSSL libs and Perl 5 at build time |
+| `pingora-boringssl` | BoringSSL API compatibility layer (identical API surface to `pingora-openssl`) | `boringssl` | Requires Clang; FIPS-compatible; used by Cloudflare internally |
+| `pingora-s2n` | AWS s2n-tls extensions: PSK, security policies, blinding delays | `s2n` | Requires native s2n-tls libraries |
+| `pingora-rustls` | Experimental pure-Rust TLS via rustls | `rustls` | Not production-ready; do not use in critical paths |
+| `pingora-header-serde` | Serialisation/deserialisation helpers for HTTP headers | — | Used by caching internals |
+| `tinyufo` | TinyUFO caching algorithm (the engine behind `pingora-memory-cache`) | — | Standalone; can be used independently |
+
+---
+
+## Getting Started with Cargo
+
+Add `pingora` to your `Cargo.toml` and select the features you need. Only one TLS provider feature can be active at a time.
+
+### Minimal HTTP proxy
+
+```toml
+[dependencies]
+pingora = { version = "0.8.0", features = ["openssl", "proxy"] }
+```
+
+This pulls in `pingora-core` (with OpenSSL TLS), `pingora-proxy`, and `pingora-http`.
+
+### With load balancing
+
+```toml
+[dependencies]
+pingora = { version = "0.8.0", features = ["openssl", "lb"] }
+```
+
+The `lb` feature implies `proxy`, so you get `pingora-proxy` and `pingora-load-balancing` together.
+
+### With caching
+
+```toml
+[dependencies]
+pingora = { version = "0.8.0", features = ["openssl", "lb", "cache"] }
+```
+
+Adds the experimental `pingora-cache` layer on top of the load-balancing setup.
+
+### Using BoringSSL instead of OpenSSL
+
+```toml
+[dependencies]
+pingora = { version = "0.8.0", features = ["boringssl", "lb"] }
+```
+
+Swap `openssl` for `boringssl` — the rest of the API is identical.
+
+---
+
+## Feature Flags
+
+| Feature | Effect |
+|---|---|
+| `openssl` | TLS via the `openssl` crate. Requires native OpenSSL and Perl 5. |
+| `boringssl` | TLS via BoringSSL. Requires Clang. FIPS-compatible. |
+| `s2n` | TLS via AWS s2n-tls. Enables PSK and advanced security policies. |
+| `rustls` | Experimental pure-Rust TLS. Not production-ready. |
+| `proxy` | Includes `pingora-proxy` and exports `pingora_proxy::prelude::*` under `pingora::proxy`. |
+| `lb` | Includes `pingora-load-balancing` (and implies `proxy`). Exports under `pingora::lb`. |
+| `cache` | Includes `pingora-cache` (experimental). Exports under `pingora::cache`. |
+| `time` | Includes timeout and scheduling utilities from `pingora-timeout`. |
+| `sentry` | Enables Sentry error-reporting integration in `pingora-core`. |
+| `dial9` | Enables Tokio runtime telemetry (requires `--cfg tokio_unstable`). |
+| `dial9-worker-s3` | Adds S3-compatible trace-segment upload to `dial9`. Implies `dial9`. |
+| `connection_filter` | Enables pre-TLS TCP connection filtering via `ConnectionFilter` trait. |
+| `upstream_modules` | Enables the `adjust_upstream_modules` callback for custom upstream response processing. |
+
+<Note>
+Only one TLS provider feature (`openssl`, `boringssl`, `s2n`, or `rustls`) can be selected at a time. Selecting more than one will cause a compile error.
+</Note>
+
+---
+
+## Major Sub-Crates
+
+<CardGroup cols={2}>
+  <Card title="Load Balancing" icon="scale-balanced" href="/reference/load-balancing">
+    Backend selection with RoundRobin, Ketama consistent hashing, health checks, and dynamic service discovery via `pingora-load-balancing`.
+  </Card>
+  <Card title="Caching" icon="database" href="/reference/caching">
+    HTTP-level caching state machine with pluggable storage backends via `pingora-cache` (experimental).
+  </Card>
+  <Card title="TLS" icon="lock" href="/reference/tls">
+    Choose from OpenSSL, BoringSSL, s2n-tls, or experimental rustls — all behind a uniform API.
+  </Card>
+  <Card title="Internals" icon="microchip" href="/reference/internals">
+    Threading model, Tokio runtime configuration, service architecture, and connection lifecycle.
+  </Card>
+</CardGroup>

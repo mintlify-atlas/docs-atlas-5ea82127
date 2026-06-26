@@ -1,0 +1,147 @@
+---
+title: "Retry Logic and Failover Between Upstreams"
+sidebarTitle: "Failover"
+description: "Implement retry and failover in Pingora using fail_to_connect and error_while_proxy — mark errors retryable and select alternate upstreams on retry."
+---
+
+When an upstream connection fails, Pingora gives you full control over what happens next. You can give up and return an error to the client, retry the same upstream, or — with a small amount of routing logic in `CTX` — transparently fail over to a completely different upstream. This guide covers how the failure model works, when retries are safe, and how to implement failover with a concrete example.
+
+## When Can You Retry?
+
+Whether a retry is safe depends on what has already happened when the failure occurs. Pingora distinguishes two failure points:
+
+**`fail_to_connect()`** — called when the proxy cannot establish a connection to the upstream at all. At this point, nothing has been sent to the upstream, and the downstream client has received no response bytes. This is the safest possible moment to retry: you have complete freedom to try a different upstream without any risk of double-processing.
+
+**`error_while_proxy()`** — called when an error occurs after a connection is established and in use. At this point, the upstream may have already received and partially processed the request. Retrying here is safe only for idempotent HTTP methods (GET, HEAD, OPTIONS, etc.) where processing the request twice has no side effects.
+
+In both cases, retrying is gated on the proxy not having sent any response bytes to the downstream yet. Once the downstream has received data, there is nothing the proxy can do except log and give up.
+
+<Warning>
+Do not retry non-idempotent requests (POST, PUT, PATCH, DELETE) after `error_while_proxy()` unless you have specific knowledge that the upstream handles duplicates safely. When `fail_to_connect()` fires, however, Pingora guarantees nothing was sent upstream — retrying even a POST is safe at that point.
+</Warning>
+
+## Making an Error Retryable
+
+To enable a retry, call `e.set_retry(true)` on the error inside `fail_to_connect()` or `error_while_proxy()`. When Pingora sees a retryable error, it calls `upstream_peer()` again instead of proceeding to `fail_to_proxy()`.
+
+```rust
+fn fail_to_connect(
+    &self,
+    _session: &mut Session,
+    _peer: &HttpPeer,
+    _ctx: &mut Self::CTX,
+    mut e: Box<Error>,
+) -> Box<Error> {
+    e.set_retry(true);
+    e
+}
+```
+
+On the next call to `upstream_peer()`, your implementation can return the same peer (retry the same upstream) or a different one (failover). The `CTX` object is the mechanism for communicating which behavior is desired.
+
+## Failover Implementation
+
+The pattern is straightforward:
+
+1. Track the number of attempts in `CTX` (e.g., a `tries: usize` field).
+2. In `fail_to_connect()`, increment the counter and set `e.set_retry(true)` — but only for the first failure. If the secondary also fails, do not retry again.
+3. In `upstream_peer()`, check the counter and return a different peer when `tries >= 1`.
+
+Here is the complete example, where the proxy first tries `192.0.2.1` and falls over to `1.1.1.1` on the first connection failure:
+
+```rust
+use async_trait::async_trait;
+use pingora_proxy::{ProxyHttp, Session};
+use pingora_error::{Error, Result};
+use pingora_core::upstreams::peer::HttpPeer;
+use std::time::Duration;
+
+pub struct MyProxy;
+
+pub struct MyCtx {
+    tries: usize,
+}
+
+#[async_trait]
+impl ProxyHttp for MyProxy {
+    type CTX = MyCtx;
+
+    fn new_ctx(&self) -> Self::CTX {
+        MyCtx { tries: 0 }
+    }
+
+    fn fail_to_connect(
+        &self,
+        _session: &mut Session,
+        _peer: &HttpPeer,
+        ctx: &mut Self::CTX,
+        mut e: Box<Error>,
+    ) -> Box<Error> {
+        if ctx.tries > 0 {
+            // Already tried the secondary — give up
+            return e;
+        }
+        ctx.tries += 1;
+        e.set_retry(true);
+        e
+    }
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        ctx: &mut Self::CTX,
+    ) -> Result<Box<HttpPeer>> {
+        let addr = if ctx.tries < 1 {
+            ("192.0.2.1", 443)   // primary upstream
+        } else {
+            ("1.1.1.1", 443)     // fallback upstream
+        };
+
+        let mut peer = Box::new(HttpPeer::new(addr, true, "one.one.one.one".to_string()));
+        peer.options.connection_timeout = Some(Duration::from_millis(100));
+        Ok(peer)
+    }
+}
+```
+
+**Walking through the flow:**
+
+1. First request: `tries = 0`, so `upstream_peer()` selects `192.0.2.1`.
+2. Connection to `192.0.2.1` fails → `fail_to_connect()` is called.
+   - `ctx.tries` is `0`, so we increment it to `1` and set `e.set_retry(true)`.
+3. Pingora calls `upstream_peer()` again. Now `tries = 1 >= 1`, so it selects `1.1.1.1`.
+4. If `1.1.1.1` also fails → `fail_to_connect()` is called again.
+   - `ctx.tries` is `1 > 0`, so we return the error without setting retry → `fail_to_proxy()` is called and a 502 is sent.
+
+## Retry vs. Failover
+
+These two strategies are closely related but distinct:
+
+| | Retry | Failover |
+|---|-------|---------|
+| **Target** | Same upstream peer | Different upstream peer |
+| **Use case** | Transient network hiccup on a reused connection | Primary upstream is unavailable |
+| **Implementation** | Set retry; return the same `HttpPeer` in `upstream_peer()` | Set retry; update `CTX`; return a different `HttpPeer` in `upstream_peer()` |
+
+Pingora supports both naturally through the same mechanism — the distinction is entirely in how `upstream_peer()` uses `CTX` to decide which peer to return on the second call.
+
+## Handling `error_while_proxy`
+
+The default implementation of `error_while_proxy()` already handles the most common retry case: if the error occurred on a **reused** connection and the retry buffer has not been truncated (nothing sent downstream), it automatically marks the error retryable. This transparently recovers from stale pooled connections without any code in your implementation.
+
+For custom retry behavior on mid-stream errors, override `error_while_proxy()`:
+
+```rust
+fn error_while_proxy(
+    &self,
+    peer: &HttpPeer,
+    session: &mut Session,
+    mut e: Box<Error>,
+    ctx: &mut Self::CTX,
+    client_reused: bool,
+) -> Box<Error> {
+    // Only retry on reused connections where nothing has been sent downstream
+    e.retry.decide_reuse(client_reused && !session.as_ref().retry_buffer_truncated());
+    e
+}
+```

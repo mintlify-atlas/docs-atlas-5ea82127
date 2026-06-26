@@ -1,0 +1,105 @@
+---
+title: "Pingora: Fast, Reliable Network Services in Rust"
+sidebarTitle: "Introduction"
+description: "Pingora is a Rust framework for building programmable HTTP proxies and network services — battle-tested at Cloudflare serving over 40 million requests per second."
+---
+
+Pingora is a Rust framework for building fast, reliable, and programmable networked systems. Born inside Cloudflare's infrastructure, it has been serving more than 40 million Internet requests per second for several years — powering the reverse proxy that connects Cloudflare to the rest of the Internet. In 2024 Cloudflare open-sourced Pingora, making that same battle-tested foundation available to anyone who wants to build high-performance proxies, API gateways, load balancers, or any other network service in Rust.
+
+## Why Pingora?
+
+Pingora addresses three of the most common pain points in network service development: safety, speed, and flexibility. Services traditionally written in C or C++ carry the constant risk of memory-safety bugs — use-after-free, buffer overflows, and data races that can silently corrupt production traffic or expose security vulnerabilities. Pingora eliminates that entire class of bugs by building on Rust's ownership model. At the same time it never sacrifices performance: the async Rust runtime keeps threads busy rather than idle, and the architecture is designed to minimise per-request allocations. Finally, the `ProxyHttp` trait exposes every stage of the request lifecycle as an overridable hook, so your business logic is never fighting against the framework.
+
+<CardGroup cols={2}>
+  <Card title="Memory Safety" icon="shield-halved" href="/introduction#why-pingora">
+    Written in Rust, Pingora eliminates entire classes of C/C++ memory-safety bugs — use-after-free, buffer overflows, and data races — without a garbage-collector tax.
+  </Card>
+  <Card title="High Performance" icon="bolt" href="/introduction#why-pingora">
+    Async Rust keeps every thread productive. Pingora's architecture is tuned for minimal per-request overhead, making it suitable for the highest-traffic environments on the Internet.
+  </Card>
+  <Card title="Full Programmability" icon="code" href="/introduction#why-pingora">
+    The `ProxyHttp` trait exposes hooks at every stage of the request lifecycle — peer selection, header rewriting, response filtering — so you can express any proxy logic without forking the framework.
+  </Card>
+  <Card title="Production Pedigree" icon="cloud" href="https://blog.cloudflare.com/how-we-built-pingora-the-proxy-that-connects-cloudflare-to-the-internet">
+    Pingora has carried Cloudflare's production traffic for years, handling over 40 million requests per second. The open-source release is the same code base, not a stripped-down demo.
+  </Card>
+</CardGroup>
+
+## Feature Highlights
+
+Pingora ships with everything you need to build a production-grade proxy out of the box:
+
+- **Async Rust** — built on Tokio; every I/O operation is non-blocking and the thread pool is shared efficiently across all services hosted in the same process.
+- **HTTP/1 and HTTP/2** — full end-to-end proxy support for both protocol versions, including upgrade flows.
+- **Multiple TLS providers** — choose OpenSSL, BoringSSL (FIPS-compatible), s2n-tls, or the experimental rustls backend by enabling the corresponding Cargo feature flag.
+- **gRPC and WebSocket proxying** — first-class support for long-lived streaming connections alongside ordinary HTTP traffic.
+- **Graceful reload** — ship a new binary without dropping a single in-flight connection; the old process hands its listening sockets to the new one via a Unix socket.
+- **Customisable load balancing and failover** — the `pingora-load-balancing` crate provides round-robin, consistent-hashing (Ketama), and pluggable health-check strategies; you can also implement your own `BackendSelection` type.
+- **Observability** — built-in integration points for Prometheus metrics, structured logging, and distributed tracing.
+
+## System Requirements
+
+### Operating Systems
+
+| Tier | Platforms | Notes |
+|------|-----------|-------|
+| **Tier 1** | Linux (x86\_64, aarch64) | Primary development and test target; all features supported. |
+| **Best-effort** | macOS and other Unix-like systems | Most code compiles and runs; a small number of Linux-specific features (e.g. graceful upgrade via `SO_REUSEPORT`) may be absent. |
+| **Preliminary** | Windows | Community best-effort only — see note below. |
+
+<Note>
+  Windows support is a preliminary community effort. Core functionality may compile and run, but production use on Windows is not officially supported. If you are developing on Windows, a Linux VM or WSL2 is the recommended environment.
+</Note>
+
+### Rust Version
+
+Pingora follows a rolling **Minimum Supported Rust Version (MSRV)** policy of six months: any Rust release that is at least six months old is eligible to become the new MSRV. The current MSRV is **1.84**. Not every crate in the workspace enforces `rust-version` in its `Cargo.toml`, so it may be possible to use individual crates on slightly older toolchains, but 1.84 or later is the only configuration that is actively tested.
+
+### Build Dependencies
+
+Two native tools must be present on your system before the workspace will build cleanly:
+
+- **[Clang](https://clang.llvm.org/)** — required by the `boringssl` crate that underpins the `boringssl` feature flag.
+- **[Perl 5](https://www.perl.org/)** — required by the `openssl` crate that underpins the `openssl` feature flag.
+
+If you are only using the `rustls` or `s2n` feature flags you can omit the corresponding native dependency, but having both Clang and Perl installed is the safest starting point.
+
+## Workspace Crate Structure
+
+The Pingora repository is a Cargo workspace. The table below describes the major public-facing crates:
+
+| Crate | Purpose |
+|-------|---------|
+| `pingora` | The top-level "batteries-included" crate. Re-exports `pingora-core` and gates optional modules (`proxy`, `lb`, `cache`, `time`) behind Cargo feature flags. Start here. |
+| `pingora-core` | Protocols, connection management, server lifecycle, and the foundational traits. |
+| `pingora-proxy` | The `ProxyHttp` trait and `http_proxy_service` constructor — everything you need to build an HTTP proxy. |
+| `pingora-load-balancing` | `LoadBalancer`, `RoundRobin`, Ketama consistent hashing, and `TcpHealthCheck`. |
+| `pingora-http` | HTTP header types and manipulation APIs that preserve original header casing. |
+| `pingora-cache` | Reverse-proxy caching primitives (experimental API surface). |
+| `pingora-error` | The common `Error` type shared across all Pingora crates. |
+| `pingora-openssl` / `pingora-boringssl` | SSL extensions and APIs for the OpenSSL and BoringSSL backends respectively. |
+| `pingora-s2n` | SSL extensions for the s2n-tls backend. |
+| `pingora-ketama` | Standalone Ketama consistent-hashing implementation. |
+| `pingora-limits` | Efficient rate-limiting and counting algorithms. |
+| `pingora-memory-cache` | Async in-memory cache with a cache-lock to prevent thundering-herd stampedes. |
+| `pingora-timeout` | A more efficient async timer system that batches timer wakeups. |
+| `TinyUfo` | The cache-eviction algorithm that powers `pingora-memory-cache`. |
+
+The `pingora` umbrella crate is the recommended entry point: enable only the features you need and it will pull in the right sub-crates automatically.
+
+```toml
+[dependencies]
+async-trait = "0.1"
+pingora = { version = "0.8.0", features = ["openssl", "lb"] }
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Build a working round-robin load balancer with health checks in under 10 minutes.
+  </Card>
+  <Card title="Crates Overview" icon="cubes" href="/reference/crates-overview">
+    Explore every crate in the Pingora workspace with API surface and feature-flag documentation.
+  </Card>
+</CardGroup>

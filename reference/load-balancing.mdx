@@ -1,0 +1,299 @@
+---
+title: "Load Balancing: Algorithms, Health Checks, and Discovery"
+sidebarTitle: "Load Balancing"
+description: "Use pingora-load-balancing to select backends with RoundRobin or Ketama consistent hashing, run health checks, and implement dynamic service discovery."
+---
+
+The `pingora-load-balancing` crate provides a composable system for managing a set of upstream backends. It combines three orthogonal concerns — **service discovery** (how backends are found), **health checking** (whether each backend can serve traffic), and **selection** (which backend to pick for a given request) — into a single `LoadBalancer<S>` struct that can be run as a background service alongside your proxy.
+
+<Note>
+The `lb` feature flag in the main `pingora` crate enables this crate and re-exports its public API under `pingora::lb`. Enable it with `features = ["openssl", "lb"]` in your `Cargo.toml`.
+</Note>
+
+---
+
+## Backend
+
+A `Backend` represents a single upstream server. It holds an address, a relative weight, and an open-ended extension map for arbitrary metadata.
+
+```rust
+pub struct Backend {
+    /// The socket address of the upstream server.
+    pub addr: SocketAddr,
+    /// Relative weight for load balancing. Traffic is distributed
+    /// proportionally to this value across backends in the same pool.
+    pub weight: usize,
+    /// Arbitrary metadata attached to this backend. Two backends with the
+    /// same addr and weight but different ext values are considered identical
+    /// for selection purposes (ext is ignored during comparison/hashing).
+    pub ext: Extensions,
+}
+```
+
+Create a `Backend` with the unit weight of 1:
+
+```rust
+use pingora::lb::Backend;
+
+let b = Backend::new("1.1.1.1:80")?;
+```
+
+Or with an explicit weight:
+
+```rust
+let b = Backend::new_with_weight("1.1.1.1:80", 5)?;
+```
+
+You can attach custom metadata via the extension map:
+
+```rust
+let mut b = Backend::new("10.0.0.1:8080")?;
+b.ext.insert(MyMetadata { region: "us-east".into() });
+```
+
+---
+
+## LoadBalancer
+
+`LoadBalancer<S>` is the central type. The generic parameter `S` is the selection algorithm — any type that implements `BackendSelection`. It wraps a `Backends` collection (which holds discovery + health), a selector built from the current backend set, and timing controls for periodic updates.
+
+### Building from a static list
+
+The simplest way to create a `LoadBalancer` is from an iterator of addresses:
+
+```rust
+use pingora::lb::{LoadBalancer, selection::RoundRobin};
+
+let lb: LoadBalancer<RoundRobin> =
+    LoadBalancer::try_from_iter(["1.1.1.1:80", "1.0.0.1:80"])?;
+```
+
+`try_from_iter` performs a synchronous DNS lookup for each address (blocking network I/O), builds the backend set, and runs the initial discovery step immediately.
+
+### Selecting a backend
+
+Call `select` to get the next healthy backend:
+
+```rust
+// key: used for hash-based selection; ignored for RoundRobin
+// max_iterations: caps the search when iterating a large ring
+let backend: Option<Backend> = lb.select(b"request-key", 256);
+```
+
+Use `select_with` to apply a custom acceptance predicate — for example, to skip backends that your application has seen fail recently:
+
+```rust
+let backend = lb.select_with(b"request-key", 256, |b, healthy| {
+    healthy && !my_circuit_breaker.is_open(&b.addr)
+});
+```
+
+### Configuring update frequencies
+
+```rust
+use std::time::Duration;
+
+lb.health_check_frequency = Some(Duration::from_secs(1));
+lb.update_frequency = Some(Duration::from_secs(60));
+lb.parallel_health_check = true; // run checks concurrently
+```
+
+Setting either frequency to `None` means that phase runs only once at startup.
+
+---
+
+## Selection Algorithms
+
+`pingora-load-balancing` ships three ready-made selection algorithms and a trait for custom ones.
+
+### `RoundRobin`
+
+Sequential, weighted round-robin across all healthy backends. The `key` argument to `select` is ignored; backends are served in order, repeating proportionally to their `weight`.
+
+```rust
+use pingora::lb::{LoadBalancer, selection::RoundRobin};
+
+let lb: LoadBalancer<RoundRobin> =
+    LoadBalancer::try_from_iter(["10.0.0.1:80", "10.0.0.2:80", "10.0.0.3:80"])?;
+
+// Each call advances the round-robin pointer
+let b = lb.select(b"", 256);
+```
+
+### `Consistent` (Ketama)
+
+Consistent hashing using the Ketama algorithm from `pingora-ketama`. The same key will always map to the same backend as long as the backend set does not change. When backends are added or removed, only the minimum necessary fraction of keys are remapped.
+
+```rust
+use pingora::lb::{LoadBalancer, selection::Consistent};
+
+let lb: LoadBalancer<Consistent> =
+    LoadBalancer::try_from_iter(["10.0.0.1:80", "10.0.0.2:80"])?;
+
+// The same key always hits the same backend (while the set is stable)
+let b = lb.select(b"user-session-id", 256);
+```
+
+### `FNVHash` / `Random`
+
+`FNVHash` (also exported as `FVNHash` for backward compatibility) uses the FNV hash function on weighted backends, giving a consistent mapping without the full Ketama ring overhead. `Random` picks backends uniformly at random, weighted by `weight`.
+
+```rust
+use pingora::lb::selection::{FNVHash, Random};
+```
+
+### Custom: implement `BackendSelection`
+
+```rust
+use pingora::lb::selection::{BackendSelection, BackendIter};
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
+pub struct MySelector { /* ... */ }
+
+impl BackendSelection for MySelector {
+    type Iter = MyIter;
+    type Config = ();
+
+    fn build(backends: &BTreeSet<Backend>) -> Self { /* ... */ }
+
+    fn iter(self: &Arc<Self>, key: &[u8]) -> MyIter { /* ... */ }
+}
+```
+
+---
+
+## Health Checks
+
+Health checks probe each backend on a configurable schedule. Unhealthy backends are automatically excluded from `select` results and are re-included once they recover.
+
+### `TcpHealthCheck`
+
+Attempts a TCP (or optional TLS) connection to each backend. A backend becomes unhealthy after `consecutive_failure` consecutive failures and recovers after `consecutive_success` consecutive successes (both default to 1).
+
+```rust
+use pingora::lb::health_check::TcpHealthCheck;
+
+let hc = TcpHealthCheck::new(); // Box<TcpHealthCheck>
+```
+
+For TLS health checks, provide the SNI name:
+
+```rust
+let hc = TcpHealthCheck::new_tls("example.com");
+```
+
+### `HttpHealthCheck`
+
+Sends an HTTP GET request and validates the response. By default, any `200 OK` counts as healthy.
+
+```rust
+use pingora::lb::health_check::HttpHealthCheck;
+
+let mut hc = HttpHealthCheck::new("example.com", false /* tls */);
+
+// Optional: accept any 2xx or 3xx instead of only 200
+hc.validator = Some(Box::new(|resp| {
+    if resp.status.is_success() || resp.status.is_redirection() {
+        Ok(())
+    } else {
+        Err(pingora::Error::explain(
+            pingora::InternalError,
+            "unexpected status",
+        ))
+    }
+}));
+```
+
+### Attaching a health check to a `LoadBalancer`
+
+```rust
+use pingora::lb::{LoadBalancer, selection::RoundRobin};
+use pingora::lb::health_check::TcpHealthCheck;
+use std::time::Duration;
+
+let mut lb: LoadBalancer<RoundRobin> =
+    LoadBalancer::try_from_iter(["1.1.1.1:80", "1.0.0.1:80", "127.0.0.1:79"])?;
+
+lb.set_health_check(TcpHealthCheck::new());
+lb.health_check_frequency = Some(Duration::from_secs(1));
+```
+
+After `127.0.0.1:79` fails its TCP check, `lb.select(...)` will never return it until the check passes again. The state machine requires `consecutive_failure` failures before marking a backend unhealthy and `consecutive_success` successes before marking it healthy again, preventing flapping on transient errors.
+
+<Tip>
+Run the `LoadBalancer` as a background service so health checks and discovery updates fire automatically on their own Tokio task, independent of the request-handling path.
+
+```rust
+use pingora::services::background::background_service;
+
+let lb = Arc::new(lb);
+let bg = background_service("health-checker", lb.clone());
+server.add_service(bg);
+```
+</Tip>
+
+---
+
+## Service Discovery
+
+Service discovery controls *which* backends exist. The `ServiceDiscovery` trait returns a fresh `BTreeSet<Backend>` on each call; the `LoadBalancer` compares this to its current set and rebuilds the selector only when something changes.
+
+```rust
+use async_trait::async_trait;
+use pingora::lb::discovery::ServiceDiscovery;
+use pingora::lb::Backend;
+use pingora_error::Result;
+use std::collections::{BTreeSet, HashMap};
+
+pub struct MyDnsDiscovery;
+
+#[async_trait]
+impl ServiceDiscovery for MyDnsDiscovery {
+    async fn discover(&self) -> Result<(BTreeSet<Backend>, HashMap<u64, bool>)> {
+        // Resolve your service registry / DNS / Consul / etc.
+        let backends = resolve_backends_from_dns().await?;
+        // The second element optionally overrides per-backend enablement.
+        // Backends absent from the map are considered enabled.
+        Ok((backends, HashMap::new()))
+    }
+}
+```
+
+Wire the discovery into a `Backends` object and then build the `LoadBalancer`:
+
+```rust
+use pingora::lb::{Backends, LoadBalancer, selection::RoundRobin};
+
+let discovery = Box::new(MyDnsDiscovery);
+let backends = Backends::new(discovery);
+let mut lb = LoadBalancer::<RoundRobin>::from_backends(backends);
+lb.update_frequency = Some(Duration::from_secs(30));
+```
+
+### Built-in: `Static`
+
+For fixed backend sets, use `discovery::Static`. It is what `try_from_iter` uses under the hood:
+
+```rust
+use pingora::lb::discovery::Static;
+
+let discovery = Static::try_from_iter(["10.0.0.1:80", "10.0.0.2:80"])?;
+```
+
+You can also mutate a `Static` discovery at runtime by calling its `add` / `remove` methods, though concurrent modifications may race — for production dynamic discovery implement the `ServiceDiscovery` trait instead.
+
+---
+
+## Timing Information
+
+After each successful `update()` call, timing data is stored and can be retrieved:
+
+```rust
+if let Some(timing) = lb.last_update_timing() {
+    println!("discovery took {:?}", timing.discovery_duration);
+    println!("selector build took {:?}", timing.build_duration);
+}
+```
+
+This is useful for monitoring how long slow service-discovery calls are taking and tuning `update_frequency` accordingly.

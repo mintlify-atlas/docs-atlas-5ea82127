@@ -1,0 +1,127 @@
+---
+title: "Error Handling in Pingora with pingora-error"
+sidebarTitle: "Error Handling"
+description: "Create, wrap, and propagate errors in Pingora using pingora-error — error types, sources, causes, context strings, and retry semantics."
+---
+
+Pingora provides a dedicated `pingora-error` crate that every other Pingora crate uses for error handling. Rather than relying on raw `std::io::Error` or a generic boxed trait object, `pingora-error` defines a structured `Error` type that carries a classification of what went wrong, where it came from, and — when useful — the underlying cause in a full chain. This makes errors machine-readable for retry decisions, human-readable in log output, and composable through a set of ergonomic builder functions.
+
+All Pingora phases return a `pingora_error::Result<_>`, which is an alias for `std::result::Result<_, Box<Error>>`.
+
+## Error Anatomy
+
+Every `Error` in Pingora has up to four components:
+
+| Component | Description |
+|-----------|-------------|
+| **Type** | What kind of error occurred, e.g. `ConnectionClosed`, `InvalidHTTPHeader`, `HTTPStatus(code)` |
+| **Source** | Where the error originated: `Upstream`, `Downstream`, or `Internal` |
+| **Cause** | An optional wrapped inner error (another `Box<Error>` or a `Box<dyn std::error::Error>`) |
+| **Context** | An optional human-readable string with additional details about the specific failure |
+
+Together, these fields let Pingora automatically map errors to HTTP status codes in `fail_to_proxy()` — upstream errors become 502, internal errors become 500, and downstream errors become 400 or are silently dropped — while still giving you a full chain of context in the error log.
+
+## Creating Errors
+
+**`Error::explain(type, context)`** creates a fresh error with a type and a context string, but no underlying cause. Use this when you are the originator of the error condition.
+
+```rust
+use pingora_error::{Error, ErrorType::InvalidHTTPHeader};
+
+fn validate_req_header(req: &RequestHeader) -> Result<()> {
+    req.headers()
+        .get(http::header::HOST)
+        .ok_or_else(|| Error::explain(InvalidHTTPHeader, "No host header detected"))
+}
+```
+
+**`new_in` / `new_up` / `new_down`** are shorthand constructors that specify the source (Internal, Upstream, Downstream) and accept a type. Use these for minimal errors when no additional context string is needed.
+
+## Wrapping Errors
+
+When propagating an error from a lower-level call, you usually want to attach higher-level context rather than discarding the original cause.
+
+**`Error::because(type, context, cause)`** creates a new error of the given type that wraps an existing cause:
+
+```rust
+let upstream_err = do_something()?;
+Error::because(ErrorType::ConnectionClosed, "upstream closed during body", upstream_err)
+```
+
+**`or_err(type, context)`** is a `Result` extension method: if the result is `Err`, it wraps the original error in a new one with the given type and context. This is the most common idiom for propagation:
+
+```rust
+validate_req_header(session.req_header())
+    .or_err(HTTPStatus(400), "Missing required headers")?;
+```
+
+**`explain_err(type, context)`** is similar but *replaces* the error rather than wrapping it — useful when the original cause is not meaningful to propagate.
+
+### Full Example: Header Validation
+
+The following example shows the complete pattern: a low-level validator creates an `InvalidHTTPHeader` error, and the calling filter wraps it in an `HTTPStatus(400)` error that instructs `fail_to_proxy()` to send a 400 Bad Request response downstream.
+
+```rust
+fn validate_req_header(req: &RequestHeader) -> Result<()> {
+    // validate that the `host` header exists
+    req.headers()
+        .get(http::header::HOST)
+        .ok_or_else(|| Error::explain(InvalidHTTPHeader, "No host header detected"))
+}
+
+impl MyServer {
+    pub async fn handle_request_filter(
+        &self,
+        http_session: &mut Session,
+        ctx: &mut CTX,
+    ) -> Result<bool> {
+        validate_req_header(session.req_header())
+            .or_err(HTTPStatus(400), "Missing required headers")?;
+        Ok(true)
+    }
+}
+```
+
+### Error Chain in Logs
+
+Because `Error::because` and `or_err` preserve the original cause, the full chain is visible in error log output. A log entry for the above failure would show both the outer `HTTPStatus(400)` context and the inner `InvalidHTTPHeader` detail, making it straightforward to trace the root cause.
+
+<Note>
+`fail_to_proxy()` automatically logs every error that reaches it. The string returned by `request_summary()` is prepended to each log entry, so you can include request-identifying context (path, request ID, client IP) in every error log line without adding it to each phase individually.
+</Note>
+
+## Retry-able Errors
+
+Some errors are transient and safe to retry. Pingora models this with a retry flag on `Error`. You set this flag in `fail_to_connect()` or `error_while_proxy()`, and Pingora uses it to decide whether to call `upstream_peer()` again.
+
+**To mark an error as retry-able:**
+
+```rust
+fn fail_to_connect(
+    &self,
+    _session: &mut Session,
+    _peer: &HttpPeer,
+    ctx: &mut Self::CTX,
+    mut e: Box<Error>,
+) -> Box<Error> {
+    e.set_retry(true);
+    e
+}
+```
+
+**Default retry behavior:**
+
+- A newly created error inherits the retry status of its direct cause. If the cause has no retry status set, the error defaults to non-retryable.
+- Some errors are automatically marked as retryable on reused connections. For example, if the remote end drops a connection that was pulled from the pool, the `error_while_proxy()` default implementation marks that error retryable — but only if the retry buffer has not been truncated (i.e., nothing has been sent downstream yet).
+
+**Retry-able vs. fresh-connection retry:**
+
+There are two distinct retry scenarios:
+
+1. **Reused-connection retry** — The proxy attempted to reuse a pooled connection but the upstream had closed it. Pingora can safely retry because nothing was sent. This is the most conservative form of retry.
+
+2. **Full retry / failover** — You explicitly set `e.set_retry(true)` in `fail_to_connect()`. `upstream_peer()` is called again, and by updating `CTX` (e.g., incrementing a `tries` counter), you can route the retry to a different upstream entirely. See the [Failover guide](/guides/failover) for a complete example.
+
+<Note>
+Non-idempotent methods like `POST` should not be retried after `error_while_proxy()` unless you have specific knowledge that the upstream server handles duplicate requests safely. When `fail_to_connect()` is called, Pingora guarantees that nothing was sent upstream, so retrying a `POST` there is safe.
+</Note>

@@ -1,0 +1,119 @@
+---
+title: "Prometheus Metrics with pingora-prometheus"
+sidebarTitle: "Prometheus"
+description: "Expose a Prometheus HTTP metrics endpoint in a Pingora service using pingora-prometheus, and define static and dynamic application metrics."
+---
+
+The [`pingora-prometheus`](https://docs.rs/pingora-prometheus) crate provides a dedicated Prometheus HTTP scrape server that can run alongside your Pingora proxy services. It gathers all metrics registered through the [`prometheus`](https://docs.rs/prometheus) crate and exposes them at an HTTP endpoint so that a Prometheus server can scrape them. This lets you instrument your proxy with counters, gauges, and histograms and have them automatically appear in the metrics output without any additional wiring.
+
+## Adding the Dependency
+
+Add `pingora-prometheus` to your `Cargo.toml`:
+
+```toml
+[dependencies]
+pingora-prometheus = "0.8.0"
+```
+
+<Note>
+The `pingora-prometheus` crate re-exports the `prometheus` crate as `pingora_prometheus::prometheus`. Using this re-export ensures your metrics are registered in the same global registry that the scrape endpoint reads from, avoiding version mismatches that would cause metrics to silently not appear.
+</Note>
+
+## Setting Up the Endpoint
+
+Pingora's Prometheus support works as a first-class service. You create a `prometheus_http_service()`, bind it to a TCP address, and register it with your server — it then runs on its own listener in parallel with your proxy service:
+
+```rust
+fn main() {
+    let mut my_server = Server::new(None).unwrap();
+    my_server.bootstrap();
+
+    // Create the Prometheus scrape endpoint and bind it to port 1234
+    let mut prometheus_service_http = pingora_prometheus::prometheus_http_service();
+    prometheus_service_http.add_tcp("0.0.0.0:1234");
+    my_server.add_service(prometheus_service_http);
+
+    my_server.run_forever();
+}
+```
+
+<Tip>
+After starting your server, Prometheus can scrape metrics at `http://<host>:1234/`. The service serves the standard Prometheus text exposition format and enables gzip compression at level 7 by default.
+</Tip>
+
+## Defining Static Metrics
+
+The simplest way to instrument your application is with [static metrics](https://docs.rs/prometheus/latest/prometheus/#static-metrics). A static metric is declared once as a global `Lazy` value. It is automatically registered in the global Prometheus registry and will appear at the scrape endpoint without any additional setup.
+
+```rust
+use once_cell::sync::Lazy;
+use pingora_prometheus::prometheus::{register_int_gauge, IntGauge};
+
+static MY_COUNTER: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!("my_counter", "my counter").unwrap()
+});
+```
+
+The `register_int_gauge!` macro (and equivalents such as `register_counter!`, `register_histogram!`) come from the `prometheus` crate. Because they are called inside a `Lazy` initializer, registration happens on first use and the process will panic if registration fails — which is the desired behavior for a static metric whose name must be unique.
+
+## Using Metrics in Proxy Filters
+
+Once a static metric is declared, you can observe or mutate it from any `ProxyHttp` callback. For example, you can increment a request counter inside `request_filter` and record upstream response latency inside `logging`:
+
+```rust
+use once_cell::sync::Lazy;
+use pingora_prometheus::prometheus::{
+    register_int_counter, register_histogram, IntCounter, Histogram,
+};
+
+static REQ_COUNTER: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!("requests_total", "Total number of requests received").unwrap()
+});
+
+static UPSTREAM_LATENCY: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!("upstream_latency_seconds", "Upstream response latency in seconds")
+        .unwrap()
+});
+
+// Inside your ProxyHttp implementation:
+async fn request_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+    REQ_COUNTER.inc();
+    Ok(false)
+}
+
+async fn logging(&self, session: &mut Session, _e: Option<&Error>, ctx: &mut Self::CTX) {
+    if let Some(elapsed) = session.time_to_first_byte_upstream() {
+        UPSTREAM_LATENCY.observe(elapsed.as_secs_f64());
+    }
+}
+```
+
+## Using Metrics with Dynamic Labels
+
+When you need per-label metric instances (e.g. a counter broken down by status code or upstream host), use the vector variants such as `IntCounterVec` or `HistogramVec`. These are also declared as `Lazy` statics and queried with `.with_label_values(&[...])` at observation time:
+
+```rust
+use once_cell::sync::Lazy;
+use pingora_prometheus::prometheus::{register_int_counter_vec, IntCounterVec};
+
+static STATUS_COUNTER: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "responses_total",
+        "Total responses grouped by HTTP status code",
+        &["status"]
+    )
+    .unwrap()
+});
+
+// Observe from your logging callback:
+async fn logging(&self, session: &mut Session, _e: Option<&Error>, ctx: &mut Self::CTX) {
+    let status = session
+        .response_written()
+        .map_or("0", |r| r.status.as_str());
+    STATUS_COUNTER.with_label_values(&[status]).inc();
+}
+```
+
+<Note>
+All `register_*!` macros are provided by the `prometheus` crate. Refer to the [prometheus crate documentation](https://docs.rs/prometheus/latest/prometheus/) for the full list of metric types — counters, gauges, histograms, and their `Vec` (labeled) variants.
+</Note>

@@ -1,0 +1,199 @@
+---
+title: "Routing, Modifying, and Intercepting Requests"
+sidebarTitle: "Modifying Requests"
+description: "Route traffic by path or header, modify request and response headers, return custom error pages, and intercept requests in Pingora proxy filters."
+---
+
+One of Pingora's core strengths is its programmable request lifecycle. At almost every stage — before connecting upstream, after receiving a response, before sending to the client — you can inspect and rewrite headers, redirect traffic, or abandon the proxy flow entirely to write a custom response. This guide walks through the most common patterns: routing by path, rewriting headers, short-circuiting with error pages, and transforming response bodies.
+
+<Tip>
+Use `request_filter` for early decisions (auth, rate limiting, routing metadata) and `upstream_request_filter` for header modifications that must be applied just before sending to the upstream. The difference matters when caching is involved: `upstream_request_filter` runs after a cache miss check, while `request_filter` runs before any cache interaction.
+</Tip>
+
+## Routing by Path
+
+The `upstream_peer()` phase has full access to the request via `session.req_header()`. You can inspect any attribute of the request — method, path, query string, headers — to decide which upstream to route to.
+
+The example below routes requests whose path starts with `/family/` to `1.0.0.1` and all other requests to `1.1.1.1`:
+
+```rust
+pub struct MyGateway;
+
+#[async_trait]
+impl ProxyHttp for MyGateway {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn upstream_peer(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Box<HttpPeer>> {
+        let addr = if session.req_header().uri.path().starts_with("/family/") {
+            ("1.0.0.1", 443)
+        } else {
+            ("1.1.1.1", 443)
+        };
+
+        info!("connecting to {addr:?}");
+
+        let peer = Box::new(HttpPeer::new(addr, true, "one.one.one.one".to_string()));
+        Ok(peer)
+    }
+}
+```
+
+Any routing logic can be used here: consistent hashing on a header value, round-robin across a peer list, lookup in an external store, or anything else. Pingora imposes no constraints on how `upstream_peer()` arrives at its result.
+
+## Modifying Request Headers
+
+Use `upstream_request_filter()` to add, modify, or remove the headers that are sent to the upstream server. This filter receives a mutable `RequestHeader` and fires after the automatic hop-by-hop stripping policy has been applied, so headers you add here are treated as application-controlled and will be forwarded as-is.
+
+```rust
+async fn upstream_request_filter(
+    &self,
+    _session: &mut Session,
+    upstream_request: &mut RequestHeader,
+    _ctx: &mut Self::CTX,
+) -> Result<()>
+where
+    Self::CTX: Send + Sync,
+{
+    upstream_request
+        .insert_header("X-Forwarded-By", "my-gateway")
+        .unwrap();
+    Ok(())
+}
+```
+
+## Modifying Response Headers
+
+Use `response_filter()` to rewrite the response headers before they reach the downstream client. This filter is called for all responses — including those served from cache — so it is the right place for headers that must always be present or absent in the final response.
+
+The example below replaces the `Server` header with a custom value and removes the `alt-svc` header (useful if your proxy doesn't support HTTP/3):
+
+```rust
+#[async_trait]
+impl ProxyHttp for MyGateway {
+    // ...
+
+    async fn response_filter(
+        &self,
+        _session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        // replace existing header if any
+        upstream_response
+            .insert_header("Server", "MyGateway")
+            .unwrap();
+        // because we don't support h3
+        upstream_response.remove_header("alt-svc");
+
+        Ok(())
+    }
+}
+```
+
+If you need to modify headers before they are written to the HTTP cache (so the cached copy has the modified headers), use `upstream_response_filter()` instead.
+
+## Returning Custom Responses
+
+Sometimes you want to reject or redirect a request entirely rather than proxying it. Return `Ok(true)` from `request_filter()` to tell Pingora that you have already written a response and the proxy flow should stop. Returning `Ok(false)` continues to the next phase as normal.
+
+The example below checks for an `Authorization` header on `/login` paths and returns a `403` response if the credentials are missing:
+
+```rust
+fn check_login(req: &pingora_http::RequestHeader) -> bool {
+    // implement your auth check logic here
+    req.headers.get("Authorization").map(|v| v.as_bytes()) == Some(b"password")
+}
+
+#[async_trait]
+impl ProxyHttp for MyGateway {
+    // ...
+
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<bool> {
+        if session.req_header().uri.path().starts_with("/login")
+            && !check_login(session.req_header())
+        {
+            let _ = session.respond_error(403).await;
+            // true: tell the proxy that the response is already written
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
+```
+
+`session.respond_error(code)` is a convenience method that writes a minimal HTTP error response with the given status code. For full control — including custom headers and a custom body — use `session.write_response_header()` and `session.write_response_body()` directly.
+
+## Modifying Response Bodies
+
+`response_body_filter()` is called once for each chunk of the response body as it is streamed to the downstream. The `body` argument is a mutable `Option<Bytes>` — set it to `None` to suppress a chunk, replace it with new `Bytes` to rewrite it, or leave it as-is to pass it through.
+
+The `end_of_stream` flag is `true` on the final call, allowing you to append a trailer or finalize any transformation.
+
+```rust
+fn response_body_filter(
+    &self,
+    _session: &mut Session,
+    body: &mut Option<Bytes>,
+    end_of_stream: bool,
+    _ctx: &mut Self::CTX,
+) -> Result<Option<Duration>>
+where
+    Self::CTX: Send + Sync,
+{
+    // Example: append a newline to every chunk
+    if let Some(b) = body {
+        let mut new_body = b.to_vec();
+        new_body.push(b'\n');
+        *b = Bytes::from(new_body);
+    }
+    // Return None to stream at full speed, or Some(Duration) to throttle
+    Ok(None)
+}
+```
+
+The optional `Duration` return value introduces a deliberate delay before the next body chunk is sent, which can be used to throttle download speed.
+
+## Adding Access Logging
+
+The `logging()` phase runs at the very end of every request — success or failure — and is the natural place for access logging and metrics. It receives the final error (if any) via `Option<&Error>`, and you can read the response status code from `session.response_written()`.
+
+```rust
+pub struct MyGateway {
+    req_metric: prometheus::IntCounter,
+}
+
+#[async_trait]
+impl ProxyHttp for MyGateway {
+    // ...
+
+    async fn logging(
+        &self,
+        session: &mut Session,
+        _e: Option<&pingora::Error>,
+        ctx: &mut Self::CTX,
+    ) {
+        let response_code = session
+            .response_written()
+            .map_or(0, |resp| resp.status.as_u16());
+        // access log
+        info!(
+            "{} response code: {response_code}",
+            self.request_summary(session, ctx)
+        );
+
+        self.req_metric.inc();
+    }
+}
+```

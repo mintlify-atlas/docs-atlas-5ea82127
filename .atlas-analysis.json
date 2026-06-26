@@ -1,0 +1,98 @@
+{
+  "projectType": "framework",
+  "projectName": "Pingora",
+  "projectDescription": "A Rust framework for building fast, reliable, and programmable networked systems and HTTP proxies at Internet scale.",
+  "theme": "aspen",
+  "primaryColor": "#f68304",
+  "lightColor": "#fcad43",
+  "darkColor": "#040404",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Running Servers",
+            "pages": [
+              "guides/server-lifecycle",
+              "guides/configuration",
+              "guides/daemonization",
+              "guides/graceful-upgrade",
+              "guides/systemd"
+            ]
+          },
+          {
+            "group": "Building Proxies",
+            "pages": [
+              "guides/proxy-phases",
+              "guides/upstream-peer",
+              "guides/request-context",
+              "guides/modifying-requests",
+              "guides/error-handling",
+              "guides/connection-pooling",
+              "guides/failover"
+            ]
+          },
+          {
+            "group": "Observability & Operations",
+            "pages": [
+              "guides/prometheus",
+              "guides/rate-limiting",
+              "guides/error-logging",
+              "guides/panic-handling"
+            ]
+          },
+          {
+            "group": "Crate Reference",
+            "pages": [
+              "reference/crates-overview",
+              "reference/load-balancing",
+              "reference/caching",
+              "reference/tls",
+              "reference/internals"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Async Rust with multi-threaded Tokio runtime and work-stealing",
+    "HTTP/1 and HTTP/2 end-to-end proxy support",
+    "TLS via OpenSSL, BoringSSL, s2n-tls, or rustls (experimental)",
+    "Highly programmable ProxyHttp trait with per-phase filter callbacks",
+    "Graceful zero-downtime binary upgrades via SIGQUIT + --upgrade",
+    "Pluggable load balancing (RoundRobin, Ketama consistent hashing, custom)",
+    "Built-in connection pooling and reuse",
+    "Retry and failover via fail_to_connect / error_while_proxy callbacks",
+    "Rate limiting with pingora-limits sliding window counters",
+    "Prometheus metrics endpoint via pingora-prometheus",
+    "HTTP caching layer (experimental) with pluggable storage backends",
+    "gRPC and WebSocket proxying",
+    "Daemonization with optional privilege dropping"
+  ],
+  "publicApiSurface": [
+    "Server::new() / Server::bootstrap() / Server::run_forever()",
+    "ProxyHttp trait: upstream_peer, request_filter, early_request_filter, upstream_request_filter, response_filter, logging, fail_to_connect, error_while_proxy",
+    "HttpPeer::new(addr, tls, sni) and PeerOptions",
+    "http_proxy_service(&configuration, impl ProxyHttp)",
+    "background_service(name, task)",
+    "LoadBalancer<S: BackendSelection>::try_from_iter()",
+    "RoundRobin, Consistent (Ketama) selection algorithms",
+    "TcpHealthCheck::new() / HttpHealthCheck",
+    "pingora_limits::rate::Rate::observe()",
+    "pingora_prometheus::prometheus_http_service()",
+    "Session::req_header() / Session::write_response_header()",
+    "ResponseHeader::build(status, headers)",
+    "Error::explain() / Error::because() / or_err() / e.set_retry(bool)",
+    "Opt::parse_args() for CLI argument parsing",
+    "ServiceDiscovery trait for dynamic backend discovery"
+  ]
+}
